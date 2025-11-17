@@ -34,6 +34,10 @@ def get_dataset(name: str) -> datasets.DatasetDict:
             "cols_to_remove": ['url', 'timestamp'],
         },
         "alpaca": {"path": "tatsu-lab/alpaca", "cols_to_remove": ['input', 'output', 'instruction']},
+        "squad": {
+            "path": "rajpurkar/squad",
+            "config_name": None,
+        }
     }
 
     if name not in ds_properties:
@@ -54,7 +58,21 @@ def get_dataset(name: str) -> datasets.DatasetDict:
         temp_ds = temp_ds.train_test_split(test_size=0.5, seed=42)
         ds["test"] = temp_ds["train"]
         ds["validation"] = temp_ds["test"]
+        
+    #we have a problem, SliceGPT expects dataset to be of type DatasetDict, but squad has context, question, answers columns, so we have  to fix it
+    if name == "squad":
+        def combine(batch):
+            batch["text"] = batch["context"] + "\n\n" + batch["question"]
+            return batch
 
+        ds = ds.map(combine)
+        ds = ds.remove_columns(["id", "title", "context", "question", "answers"])
+        
+        #in Squad is missing the test set, so we are creating it from the validation set
+        if "test" not in ds:
+            temp = ds["validation"].train_test_split(test_size=0.5, seed=42)
+            ds["validation"] = temp["train"]
+            ds["test"] = temp["test"]
     logging.info("Loading dataset done")
     return ds
 

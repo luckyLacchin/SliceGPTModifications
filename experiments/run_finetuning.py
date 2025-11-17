@@ -118,7 +118,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--ppl-eval-dataset",
         type=str,
         help="Dataset to evaluate perplexity.",
-        choices=["wikitext2", "ptb", "c4", "alpaca"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "squad"],
         default="wikitext2",
     )
     parser.add_argument(
@@ -137,7 +137,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--finetune-dataset",
         type=str,
         help="Dataset to finetune on.",
-        choices=["wikitext2", "ptb", "c4", "alpaca"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "squad"],
         default="wikitext2",
     )
     parser.add_argument(

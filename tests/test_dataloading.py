@@ -8,7 +8,7 @@ from slicegpt import data_utils, hf_utils
 
 @pytest.mark.parametrize(
     "dataset_name",
-    ["wikitext2", "ptb", "c4", "alpaca"],
+    ["wikitext2", "ptb", "c4", "alpaca"] #, "squad"], for now i don't need to include squad in the pytests
 )
 def test_get_dataset(dataset_name) -> None:
     if dataset_name == "c4":
