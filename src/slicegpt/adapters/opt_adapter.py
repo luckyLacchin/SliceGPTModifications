@@ -145,6 +145,23 @@ class OPTLayerAdapter(LayerAdapter):
 
     def get_mlp_output(self) -> Linear:
         return self.layer.fc2
+    
+    @property
+    def has_cross_attention(self) -> bool:
+        return False
+
+    def get_cross_attention_layernorm(self) -> Module:
+        raise NotImplementedError("No cross-attention")
+
+    def get_cross_attention_q_input(self) -> Linear:
+        raise NotImplementedError("No cross-attention")
+
+    def get_cross_attention_kv_inputs(self) -> list[Linear]:
+        raise NotImplementedError("No cross-attention")
+
+    def get_cross_attention_output(self) -> Linear:
+        raise NotImplementedError("No cross-attention")
+
 
 
 class OPTModelAdapter(ModelAdapter):
