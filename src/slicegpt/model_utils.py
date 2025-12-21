@@ -111,27 +111,44 @@ def get_signals(
     return mlp_ln_inputs, outputs
 
 def get_cross_attn_ln_inputs(
-    layer_adapter: LayerAdapter, layer_args: list[tuple], layer_kwargs: list[dict[str, Any]]
+    layer_adapter: LayerAdapter,
+    layer_args: list[tuple],
+    layer_kwargs: list[dict[str, Any]],
 ) -> list[torch.Tensor]:
-    assert layer_adapter.has_cross_attention
+    """
+    Run decoder layer forward and capture the inputs to the cross-attention layer_norm
+    (i.e., the LN right before EncDecAttention).
 
-    cross_ln_inputs = []
+    Returns list of tensors (one per batch item), on CPU.
+    """
+    cross_ln_inputs: list[torch.Tensor] = []
     layer_adapter.layer.to(config.device)
 
-    def hook_fn(_, args: tuple, _output: Any) -> None:
-        inp = args[0]  # RMSN.forward arg position
+    # This requires your decoder adapter to expose get_cross_attention_layernorm()
+    cross_ln = layer_adapter.get_cross_attention_layernorm()
+    assert isinstance(cross_ln, RMSN), "Expected RMSN after LN->RMSN fusion"
+
+    def hook_fn(_module, args: tuple, _output: Any) -> None:
+        inp = args[0]  # RMSN.forward first arg
         cross_ln_inputs.append(inp.cpu())
 
-    cross_ln = layer_adapter.get_cross_attention_layernorm()
-    assert isinstance(cross_ln, RMSN)
     hook = cross_ln.register_forward_hook(hook_fn)
 
-    for layer_args_batch, layer_kwargs_batch in zip(layer_args, layer_kwargs):
-        layer_args_batch, layer_kwargs_batch = utils.map_tensors([layer_args_batch, layer_kwargs_batch], device=config.device)
+    for i, (layer_args_batch, layer_kwargs_batch) in enumerate(zip(layer_args, layer_kwargs)):
+        layer_args_batch, layer_kwargs_batch = utils.map_tensors(
+            [layer_args_batch, layer_kwargs_batch], device=config.device
+        )
         _ = layer_adapter.layer(*layer_args_batch, **layer_kwargs_batch)
+
+        # reshape to (B, T, D) if it came as (B*T, D) (rare, but keep symmetry with get_signals)
+        if cross_ln_inputs[i].ndim == 2:
+            out_hidden = layer_args_batch[layer_adapter.hidden_states_args_position]
+            batch_size, seqlen, _ = out_hidden.shape
+            cross_ln_inputs[i] = cross_ln_inputs[i].reshape(batch_size, seqlen, -1)
 
     hook.remove()
     return cross_ln_inputs
+
 ''''
 def get_ln_inputs(layer_adapter, which: str, layer_args, layer_kwargs):
     ln = layer_adapter.get_cross_attention_layernorm() if which=="cross" else layer_adapter.get_second_layernorm()
@@ -209,6 +226,39 @@ def get_encoder_layer0_inputs(
     hidden_states = args[layer0_adapter.hidden_states_args_position]
     return hidden_states, args, kwargs
 
+def _ensure_decoder_input_ids(model, batch_dev: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    """
+    Ensure batch has decoder_input_ids. Prefer HF helper if available.
+    """
+    if "decoder_input_ids" in batch_dev:
+        return batch_dev
+
+    if "labels" not in batch_dev:
+        raise RuntimeError("Need labels or decoder_input_ids to run decoder")
+
+    labels = batch_dev["labels"]
+
+    # If HF provides helper, use it
+    if hasattr(model, "prepare_decoder_input_ids_from_labels"):
+        batch_dev["decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(labels=labels)
+        return batch_dev
+
+    # Fallback: standard T5 shift_right
+    pad_id = model.config.pad_token_id
+    start_id = model.config.decoder_start_token_id
+    if start_id is None:
+        start_id = pad_id
+
+    # replace -100 with pad
+    labels2 = labels.clone()
+    labels2 = torch.where(labels2 == -100, torch.tensor(pad_id, device=labels2.device), labels2)
+
+    decoder_input_ids = labels2.new_zeros(labels2.shape)
+    decoder_input_ids[:, 0] = start_id
+    decoder_input_ids[:, 1:] = labels2[:, :-1]
+    batch_dev["decoder_input_ids"] = decoder_input_ids
+    return batch_dev
+
 
 def get_decoder_layer0_inputs(
     model_adapter: ModelAdapter,
@@ -216,22 +266,6 @@ def get_decoder_layer0_inputs(
     *,
     encoder_hidden_states: Tensor,
 ) -> Tuple[Tensor, tuple, Dict[str, Any]]:
-    """
-    Returns the inputs to decoder block 0 (after embeddings),
-    plus the full args/kwargs captured for decoder block 0.
-
-    IMPORTANT: This forces cross-attention by passing encoder_outputs.
-
-    Requires ModelAdapter to implement:
-      - get_decoder_layers()
-      - get_raw_decoder_layer_at(i)
-      - set_raw_decoder_layer_at(i, new_layer)
-
-    Batch requirements (at least one of):
-      - labels  (your dataloader already sets labels = input_ids.clone())
-      - OR decoder_input_ids
-    Also usually includes input_ids + attention_mask (fine to keep).
-    """
     _move_embeddings_to_device(model_adapter, config.device)
 
     class Catcher(torch.nn.Module):
@@ -243,46 +277,39 @@ def get_decoder_layer0_inputs(
         def forward(self, *args, **kwargs):
             self.saved_args = args
             self.saved_kwargs = kwargs
-            raise ValueError("decoder catcher")
+            raise ValueError("__DECODER_CATCHER__")
 
     layer0_adapter = model_adapter.get_decoder_layers()[0]
     catcher = Catcher()
 
-    # Swap decoder block 0
     original_layer0 = model_adapter.get_raw_decoder_layer_at(0)
     model_adapter.set_raw_decoder_layer_at(0, catcher)
 
     try:
         batch_dev = utils.map_tensors(batch, device=config.device)
-
-        # Ensure decoder actually runs:
-        if "labels" not in batch_dev and "decoder_input_ids" not in batch_dev:
-            raise ValueError(
-                "Batch must include 'labels' or 'decoder_input_ids' to run the decoder. "
-                "Your prepare_dataloader() sets labels automatically for LM-style data."
-            )
-
-        # Force cross-attn: provide encoder_outputs with last_hidden_state.
-        enc_h = encoder_hidden_states.to(device=config.device)
-        encoder_outputs = BaseModelOutput(last_hidden_state=enc_h)
-
-        # Keep original input_ids/attention_mask in batch; just add encoder_outputs.
-        # HF T5ForConditionalGeneration forward accepts encoder_outputs=...
         batch_dev = dict(batch_dev)
-        batch_dev["encoder_outputs"] = encoder_outputs
+
+        # Ensure decoder_input_ids exists (robust across HF versions)
+        batch_dev = _ensure_decoder_input_ids(model_adapter.model, batch_dev)
+
+        # Force cross-attn
+        enc_h = encoder_hidden_states.to(device=config.device)
+        batch_dev["encoder_outputs"] = BaseModelOutput(last_hidden_state=enc_h)
 
         model_adapter.model(**batch_dev)
-    except ValueError:
-        pass
+
+    except ValueError as e:
+        if str(e) != "__DECODER_CATCHER__":
+            # real ValueError -> propagate
+            raise
     finally:
-        # Restore decoder block 0
         model_adapter.set_raw_decoder_layer_at(0, original_layer0)
 
     if catcher.saved_args is None:
         raise RuntimeError(
             "Decoder catcher did not trigger. "
-            "Check that model_adapter.set_raw_decoder_layer_at(0, ...) targets decoder.block[0], "
-            "and that the batch includes labels/decoder_input_ids."
+            "Verify set_raw_decoder_layer_at targets model.decoder.block[0] "
+            "and that decoder_input_ids/labels are present."
         )
 
     args = utils.map_tensors(catcher.saved_args, device="cpu")
@@ -293,3 +320,4 @@ def get_decoder_layer0_inputs(
 
     hidden_states = args[layer0_adapter.hidden_states_args_position]
     return hidden_states, args, kwargs
+

@@ -170,9 +170,20 @@ def slicing_main(args: argparse.Namespace) -> None:
         varied_seqlen=args.varied_seqlen,
         seed=args.seed,
     )
+    
+    # Sample a batch (optional debug)
+    if getattr(args, 'debug_batch_shapes', False):
+        batch = next(iter(train_loader))
+        print({k: v.shape for k, v in batch.items()})
+
+    # prepare test dataloader (for perplexity eval)
     test_loader = data_utils.prepare_test_dataloader(
-        dataset=test_dataset, tokenizer=tokenizer, batch_size=args.ppl_eval_batch_size
+        dataset=test_dataset,
+        tokenizer=tokenizer,
+        seqlen=args.seqlen,
+        batch_size=args.batch_size,
     )
+
 
     # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
     if args.sliced_model_path or args.ppl_only:
@@ -221,8 +232,23 @@ def slicing_main(args: argparse.Namespace) -> None:
         f"New embedding dimension: {new_embedding_dimension} (sparsity {100*(1 - new_embedding_dimension / model_adapter.hidden_size):.4f} %)"
     )
 
-    scheduler = ConstSlicingScheduler(new_embedding_dimension)
-    rotate.rotate_and_slice(model_adapter, train_loader, scheduler, final_orientation=args.final_orientation)
+    slicing_scheduler = ConstSlicingScheduler(new_embedding_dimension)
+        # Rotate + slice
+    # For seq2seq models (e.g., FLAN-T5) we must slice encoder+decoder with cross-attention.
+    if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
+        rotate.rotate_and_slice_seq2seq(
+            model_adapter,
+            train_loader,
+            slicing_scheduler,
+            final_orientation=args.final_orientation,
+        )
+    else:
+        rotate.rotate_and_slice(
+            model_adapter,
+            train_loader,
+            slicing_scheduler,
+            final_orientation=args.final_orientation,
+        )
 
     if args.save_dir:
         sliced_model_dir = pathlib.Path(args.save_dir)

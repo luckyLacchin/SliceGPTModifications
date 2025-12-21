@@ -309,37 +309,50 @@ class T5ModelAdapter(ModelAdapter):
         out = self._model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
         return out.logits
 
-    # ---- seq2seq-specific accessors used by your new catcher code ----
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+    def _enc(self):
+        return self._model.get_encoder() if hasattr(self._model, "get_encoder") else self._model.encoder
 
+    def _dec(self):
+        return self._model.get_decoder() if hasattr(self._model, "get_decoder") else self._model.decoder
+
+    # -------------------------
+    # Layer accessors
+    # -------------------------
     def get_encoder_layers(self) -> list[LayerAdapter]:
-        return [T5BlockLayerAdapter(layer) for layer in self._model.encoder.block]
+        enc = self._enc()
+        return [T5BlockLayerAdapter(layer) for layer in enc.block]
 
     def get_decoder_layers(self) -> list[LayerAdapter]:
-        return [T5DecoderBlockLayerAdapter(layer) for layer in self._model.decoder.block]
+        dec = self._dec()
+        return [T5DecoderBlockLayerAdapter(layer) for layer in dec.block]
 
-    # For older SliceGPT code that expects a single list of layers:
+    # legacy SliceGPT API → encoder stack
     def get_layers(self) -> list[LayerAdapter]:
         return self.get_encoder_layers()
 
-    def get_raw_layer_at(self, index: int) -> Module:
-        # legacy path: encoder
-        return self._model.encoder.block[index]
+    # -------------------------
+    # Raw layer access (used by catchers)
+    # -------------------------
+    def get_raw_layer_at(self, index: int):
+        return self._enc().block[index]
 
-    def set_raw_layer_at(self, index: int, new_layer: Module) -> None:
-        # legacy path: encoder
-        self._model.encoder.block[index] = new_layer
+    def set_raw_layer_at(self, index: int, new_layer):
+        self._enc().block[index] = new_layer
 
-    def get_raw_encoder_layer_at(self, index: int) -> Module:
-        return self._model.encoder.block[index]
+    def get_raw_encoder_layer_at(self, index: int):
+        return self._enc().block[index]
 
-    def set_raw_encoder_layer_at(self, index: int, new_layer: Module) -> None:
-        self._model.encoder.block[index] = new_layer
+    def set_raw_encoder_layer_at(self, index: int, new_layer):
+        self._enc().block[index] = new_layer
 
-    def get_raw_decoder_layer_at(self, index: int) -> Module:
-        return self._model.decoder.block[index]
+    def get_raw_decoder_layer_at(self, index: int):
+        return self._dec().block[index]
 
-    def set_raw_decoder_layer_at(self, index: int, new_layer: Module) -> None:
-        self._model.decoder.block[index] = new_layer
+    def set_raw_decoder_layer_at(self, index: int, new_layer):
+        self._dec().block[index] = new_layer
 
     # ---- compression layer replacement ----
 
