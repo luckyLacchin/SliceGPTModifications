@@ -3,13 +3,15 @@
 
 import logging
 
+import copy
+
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
 from .config import config
-from .model_adapter import LayerAdapter, ModelAdapter
+from .model_adapter import LayerAdapter, ModelAdapter, SlicingConfig
 from .model_utils import get_layer0_inputs, get_signals, get_encoder_layer0_inputs, get_decoder_layer0_inputs, get_cross_attn_ln_inputs
 from .slicing_scheduler import ConfigSlicingScheduler, ConstSlicingScheduler, SlicingScheduler
 from .utils import cleanup_memory, map_tensors
@@ -131,13 +133,33 @@ def rotate_and_slice(
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
     """
-    if getattr(model_adapter.config, "is_encoder_decoder", False):
-        #rotate_and_slice_seq2seq(...)
-        return #we have still to implement this fully
-    elif model_adapter.parallel_blocks:
-        rotate_and_slice_parallel(...)
+    # Seq2seq models (e.g., T5/FLAN-T5) require slicing encoder+decoder with cross-attention.
+    if getattr(model_adapter.config, "is_encoder_decoder", False) and hasattr(model_adapter, "get_encoder_layers"):
+        rotate_and_slice_seq2seq(
+            model_adapter,
+            dataloader,
+            slicing_scheduler,
+            apply_mask=apply_mask,
+            final_orientation=final_orientation,
+        )
+        return
+
+    if model_adapter.parallel_blocks:
+        rotate_and_slice_parallel(
+            model_adapter,
+            dataloader,
+            slicing_scheduler,
+            apply_mask=apply_mask,
+            final_orientation=final_orientation,
+        )
     else:
-        rotate_and_slice_sequential(...)
+        rotate_and_slice_sequential(
+            model_adapter,
+            dataloader,
+            slicing_scheduler,
+            apply_mask=apply_mask,
+            final_orientation=final_orientation,
+        )
 
 
 
@@ -601,12 +623,6 @@ def slice_cross_attention_output(layer_adapter, new_out_dim: int) -> None:
     Wo.out_features = new_out_dim
 
 
-'''
-def rotate_and_slice_seq2seq(model_adapter, dataloader, slicing_scheduler, ...):
-    # 1) run encoder stack slicing: produce final Q_enc_out and store sliced encoder outputs for each batch
-    # 2) run decoder slicing with cross-attn using those encoder outputs
-'''
-
 @torch.no_grad()
 def rotate_and_slice_seq2seq(
     model_adapter: ModelAdapter,
@@ -622,10 +638,10 @@ def rotate_and_slice_seq2seq(
     # 0) Collect encoder layer0 inputs (after embeddings)
     # -------------------------
     enc_inps, enc_args, enc_kwargs, enc_ignore_masks = [], [], [], []
-    dec_batches = []  # keep original batches for later decoder pass
+    dec_batches = []
 
     for batch in dataloader:
-        dec_batches.append(batch)  # keep it
+        dec_batches.append(batch)
         inp0, args0, kwargs0 = get_encoder_layer0_inputs(model_adapter, batch)
         enc_inps.append(inp0)
         enc_args.append(args0)
@@ -633,16 +649,20 @@ def rotate_and_slice_seq2seq(
         if apply_mask:
             enc_ignore_masks.append(batch["attention_mask"])
 
-    # Setup scheduler as seq2seq (you'll extend it or just reuse two schedulers)
-    # Practical approach: run scheduler.setup twice (encoder + decoder)
     enc_layers = model_adapter.get_encoder_layers()
     dec_layers = model_adapter.get_decoder_layers()
 
-    slicing_scheduler.setup(
-        hidden_size=model_adapter.hidden_size,
-        layers_num=len(enc_layers) + len(dec_layers),
-        parallel_blocks=False
-    )
+    # ======================================================================
+    # Option 1 (safest): run TWO independent scheduler setups
+    #   - encoder scheduler: layers_num = #encoder layers
+    #   - decoder scheduler: layers_num = #decoder layers
+    # The only coupling between the two stacks is the *encoder output dimension*
+    # which becomes the KV input dimension for decoder cross-attention.
+    # ======================================================================
+    enc_sched: SlicingScheduler = copy.deepcopy(slicing_scheduler)
+    dec_sched: SlicingScheduler = copy.deepcopy(slicing_scheduler)
+    enc_sched.setup(hidden_size=model_adapter.hidden_size, layers_num=len(enc_layers), parallel_blocks=False)
+    dec_sched.setup(hidden_size=model_adapter.hidden_size, layers_num=len(dec_layers), parallel_blocks=False)
 
     # -------------------------
     # 1) Rotate/slice shared embeddings using PCA on encoder layer0 inputs
@@ -650,100 +670,87 @@ def rotate_and_slice_seq2seq(
     _, Q = pca_calc(enc_inps, enc_ignore_masks)
     Q = Q.to(config.device)
 
+    emb_dims = enc_sched.get_embedding_dimensions()
     if final_orientation == "random":
-        R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
+        R = random_orthogonal_upper_left(Q.shape[0], emb_dims[0])
         Q = Q @ R.to(Q.device)
 
     rotate_embeddings(model_adapter, Q)
-    slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+    slice_embeddings(model_adapter, emb_dims)
+    # keep decoder scheduler embedding config consistent (shared weights)
+    _ = dec_sched.get_embedding_dimensions()
 
     # -------------------------
-    # 2) Encoder stack: same as rotate_and_slice_sequential
+    # 2) Encoder stack
     # -------------------------
-    Q_enc = Q  # current basis for encoder hidden states
-
+    Q_enc = Q
     for idx, layer_adapter in enumerate(tqdm(enc_layers, desc="Rotating/slicing encoder", unit="layer")):
         layer = layer_adapter.layer
         layer.attn_shortcut_Q = nn.Parameter(Q_enc.T.clone().to(dtype=dtype))
 
+        d_sa_in = enc_sched.get_attention_input_dimension(idx)
         rotate_attention_inputs(layer_adapter, Q_enc)
-        slice_attention_inputs(layer_adapter, slicing_scheduler.get_attention_input_dimension(idx))
+        slice_attention_inputs(layer_adapter, d_sa_in)
 
-        # update inputs to this layer
         for i, inp in enumerate(enc_inps):
             enc_args[i] = layer_adapter.get_updated_args(
-                torch.matmul(inp.to(config.device), Q_enc.to(dtype=dtype))[
-                    :, :, : slicing_scheduler.get_attention_input_dimension(idx)
-                ].cpu(),
+                torch.matmul(inp.to(config.device), Q_enc.to(dtype=dtype))[:, :, :d_sa_in].cpu(),
                 enc_args[i],
             )
 
-        # PCA at FFN boundary (your existing get_signals hooks second LN)
         mlp_ln_inputs, _ = get_signals(layer_adapter, enc_args, enc_kwargs)
         _, Q_mid = pca_calc(mlp_ln_inputs, enc_ignore_masks)
         Q_mid = Q_mid.to(config.device, dtype=torch.float64)
 
+        d_sa_out = enc_sched.get_attention_output_dimension(idx, match_head_dim=False)
         if final_orientation == "random":
-            R = random_orthogonal_upper_left(
-                Q_mid.shape[0],
-                slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False),
-            )
+            R = random_orthogonal_upper_left(Q_mid.shape[0], d_sa_out)
             Q_mid = Q_mid @ R.to(Q_mid.device)
 
-        # update attn shortcut + rotate/slice attn output
-        layer.attn_shortcut_Q = nn.Parameter(
-            torch.matmul(
-                layer.attn_shortcut_Q,
-                Q_mid.to(dtype=dtype)[:, : slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)],
-            )
-        )
+        layer.attn_shortcut_Q = nn.Parameter(torch.matmul(layer.attn_shortcut_Q, Q_mid.to(dtype=dtype)[:, :d_sa_out]))
         rotate_attention_output(layer_adapter, Q_mid)
-        slice_attention_output(layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False))
+        slice_attention_output(layer_adapter, d_sa_out)
 
-        # rotate/slice FFN input
-        layer.mlp_shortcut_Q = nn.Parameter(
-            Q_mid.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
-        )
+        d_mlp_in = enc_sched.get_mlp_input_dimension(idx)
+        layer.mlp_shortcut_Q = nn.Parameter(Q_mid.T.clone().to(dtype=dtype)[:d_mlp_in, :])
         rotate_mlp_input(layer_adapter, Q_mid)
-        slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(idx))
+        slice_mlp_input(layer_adapter, d_mlp_in)
 
         cleanup_memory()
 
-        # run layer to get next signals
         _, enc_inps = get_signals(layer_adapter, enc_args, enc_kwargs)
-
         _, Q_next = pca_calc(enc_inps, enc_ignore_masks)
         Q_next = Q_next.to(config.device, dtype=torch.float64)
 
+        d_mlp_out = enc_sched.get_mlp_output_dimension(idx)
         if final_orientation == "random":
-            R = random_orthogonal_upper_left(Q_next.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
+            R = random_orthogonal_upper_left(Q_next.shape[0], d_mlp_out)
             Q_next = Q_next @ R.to(Q_next.device)
 
         layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q_next.to(dtype=dtype)))
-
         rotate_mlp_output(layer_adapter, Q_next)
-        slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
-        layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(idx)])
+        slice_mlp_output(layer_adapter, d_mlp_out)
+        layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, :d_mlp_out])
 
         layer.to("cpu")
         cleanup_memory()
 
-        Q_enc = Q_next  # encoder basis progresses like decoder-only case
+        Q_enc = Q_next
 
-    # After encoder loop:
-    Q_enc_out = Q_enc  # IMPORTANT: basis of encoder outputs
-    enc_outs = enc_inps  # list of CPU tensors per batch (encoder outputs, already sliced)
+    # Encoder results
+    Q_enc_out = Q_enc
+    enc_outs = enc_inps  # CPU tensors (B, T, Denc)
+    enc_kv_dim = enc_outs[0].shape[-1]
 
     # -------------------------
     # 3) Decoder stack
     # -------------------------
     dec_inps, dec_args, dec_kwargs, dec_ignore_masks = [], [], [], []
-
     for batch, enc_h in zip(dec_batches, enc_outs):
         inp0, args0, kwargs0 = get_decoder_layer0_inputs(
             model_adapter,
             batch,
-            encoder_hidden_states=enc_h,  # already sliced encoder outputs (CPU tensor)
+            encoder_hidden_states=enc_h,
         )
         dec_inps.append(inp0)
         dec_args.append(args0)
@@ -751,23 +758,13 @@ def rotate_and_slice_seq2seq(
         if apply_mask:
             dec_ignore_masks.append(batch["attention_mask"])
 
-    # decoder starts in embedding basis
     Q_dec = Q
-
-    # encoder final dim (after slicing). This is the dim K/V must see.
-    # enc_outs is a list of (B, T, Denc) tensors on CPU
-    enc_dim = enc_outs[0].shape[-1]
-
-    base = len(enc_layers)
-
     for j, layer_adapter in enumerate(tqdm(dec_layers, desc="Rotating/slicing decoder", unit="layer")):
-        layer_idx = base + j
         layer = layer_adapter.layer
 
-        # ---- (A) Self-attention ----
-        d_sa_in = slicing_scheduler.get_attention_input_dimension(layer_idx)
+        # (A) Self-attention
         layer.attn_shortcut_Q = nn.Parameter(Q_dec.T.clone().to(dtype=dtype))
-
+        d_sa_in = dec_sched.get_attention_input_dimension(j)
         rotate_attention_inputs(layer_adapter, Q_dec)
         slice_attention_inputs(layer_adapter, d_sa_in)
 
@@ -777,75 +774,55 @@ def rotate_and_slice_seq2seq(
                 dec_args[i],
             )
 
-        # ---- (B) PCA at cross-attn LN boundary ----
+        # (B) PCA at cross-attn LN boundary
         cross_ln_inputs = get_cross_attn_ln_inputs(layer_adapter, dec_args, dec_kwargs)
         _, Q_after_self = pca_calc(cross_ln_inputs, dec_ignore_masks)
         Q_after_self = Q_after_self.to(config.device, dtype=torch.float64)
 
-        d_sa_out = slicing_scheduler.get_attention_output_dimension(layer_idx, match_head_dim=False)
-
+        d_sa_out = dec_sched.get_attention_output_dimension(j, match_head_dim=False)
         if final_orientation == "random":
             R = random_orthogonal_upper_left(Q_after_self.shape[0], d_sa_out)
             Q_after_self = Q_after_self @ R.to(Q_after_self.device)
 
-        # update self-attn shortcut to map residual into new decoder basis (and sliced dim)
-        layer.attn_shortcut_Q = nn.Parameter(
-            torch.matmul(layer.attn_shortcut_Q, Q_after_self.to(dtype=dtype)[:, :d_sa_out])
-        )
-
+        layer.attn_shortcut_Q = nn.Parameter(torch.matmul(layer.attn_shortcut_Q, Q_after_self.to(dtype=dtype)[:, :d_sa_out]))
         rotate_attention_output(layer_adapter, Q_after_self)
         slice_attention_output(layer_adapter, d_sa_out)
 
-        # ---- (C) Cross-attention ----
-        # decoder dim entering cross-attn is the self-attn output dim
+        # (C) Cross-attention (KV lives in encoder space)
         d_ca_in = d_sa_out
-
-        # init cross shortcut as square (full), then we'll slice it in slice_cross_attention_inputs
         layer.cross_attn_shortcut_Q = nn.Parameter(Q_after_self.T.clone().to(dtype=dtype))
-
         rotate_cross_attention_inputs(layer_adapter, Q_dec=Q_after_self, Q_enc=Q_enc_out)
-        slice_cross_attention_inputs(layer_adapter, new_q_dim=d_ca_in, new_kv_dim=enc_dim)
+        slice_cross_attention_inputs(layer_adapter, new_q_dim=d_ca_in, new_kv_dim=enc_kv_dim)
 
-        # ---- (D) PCA at FFN LN boundary (after cross-attn) ----
+        # (D) PCA at FFN LN boundary
         mlp_ln_inputs, _ = get_signals(layer_adapter, dec_args, dec_kwargs)
         _, Q_after_cross = pca_calc(mlp_ln_inputs, dec_ignore_masks)
         Q_after_cross = Q_after_cross.to(config.device, dtype=torch.float64)
 
-        d_ca_out = slicing_scheduler.get_attention_output_dimension(layer_idx, match_head_dim=False)
-
+        # We keep decoder attention-output dim consistent with the scheduler at this layer.
+        d_ca_out = dec_sched.get_attention_output_dimension(j, match_head_dim=False)
         if final_orientation == "random":
             R = random_orthogonal_upper_left(Q_after_cross.shape[0], d_ca_out)
             Q_after_cross = Q_after_cross @ R.to(Q_after_cross.device)
 
-        # Update cross-attn shortcut to map residual into Q_after_cross basis and sliced dim
-        # cross_attn_shortcut_Q is currently (d_ca_in x d_ca_in)
         layer.cross_attn_shortcut_Q = nn.Parameter(
             torch.matmul(layer.cross_attn_shortcut_Q, Q_after_cross.to(dtype=dtype)[:d_ca_in, :d_ca_out])
         )
-
         rotate_cross_attention_output(layer_adapter, Q_after_cross)
         slice_cross_attention_output(layer_adapter, d_ca_out)
 
-
-        # ================
-        # (E) FFN block (like sequential)
-        # ================
-        d_mlp_in = slicing_scheduler.get_mlp_input_dimension(layer_idx)
-        d_mlp_out = slicing_scheduler.get_mlp_output_dimension(layer_idx)
-
-        layer.mlp_shortcut_Q = nn.Parameter(
-            Q_after_cross.T.clone().to(dtype=dtype)[:d_mlp_in, :]
-        )
+        # (E) FFN
+        d_mlp_in = dec_sched.get_mlp_input_dimension(j)
+        d_mlp_out = dec_sched.get_mlp_output_dimension(j)
+        layer.mlp_shortcut_Q = nn.Parameter(Q_after_cross.T.clone().to(dtype=dtype)[:d_mlp_in, :])
         rotate_mlp_input(layer_adapter, Q_after_cross)
         slice_mlp_input(layer_adapter, d_mlp_in)
 
         cleanup_memory()
 
-        # run layer and compute next PCA on outputs
         _, dec_inps = get_signals(layer_adapter, dec_args, dec_kwargs)
         _, Q_next = pca_calc(dec_inps, dec_ignore_masks)
         Q_next = Q_next.to(config.device, dtype=torch.float64)
-
         if final_orientation == "random":
             R = random_orthogonal_upper_left(Q_next.shape[0], d_mlp_out)
             Q_next = Q_next @ R.to(Q_next.device)
@@ -860,12 +837,38 @@ def rotate_and_slice_seq2seq(
 
         Q_dec = Q_next
 
-
     # -------------------------
     # 4) Head
     # -------------------------
     rotate_head(model_adapter, Q_dec)
-    if slicing_scheduler.do_slice_head:
-        slice_head(model_adapter, slicing_scheduler.get_head_dimension())
+    if dec_sched.do_slice_head:
+        slice_head(model_adapter, dec_sched.get_head_dimension())
 
-    model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
+    # -------------------------
+    # 5) Save a merged slicing config (encoder indices first, decoder indices offset)
+    # -------------------------
+    merged = SlicingConfig(
+        hidden_size=model_adapter.hidden_size,
+        layers_num=len(enc_layers) + len(dec_layers),
+        do_slice_head=dec_sched.do_slice_head,
+        parallel_blocks=False,
+    )
+    merged.embedding_dimensions = enc_sched.slicing_conf.embedding_dimensions
+
+    # encoder [0..E-1]
+    merged.attention_input_dimensions.update(enc_sched.slicing_conf.attention_input_dimensions)
+    merged.attention_output_dimensions.update(enc_sched.slicing_conf.attention_output_dimensions)
+    merged.mlp_input_dimensions.update(enc_sched.slicing_conf.mlp_input_dimensions)
+    merged.mlp_output_dimensions.update(enc_sched.slicing_conf.mlp_output_dimensions)
+
+    # decoder offset by E
+    off = len(enc_layers)
+    merged.attention_input_dimensions.update({k + off: v for k, v in dec_sched.slicing_conf.attention_input_dimensions.items()})
+    merged.attention_output_dimensions.update({k + off: v for k, v in dec_sched.slicing_conf.attention_output_dimensions.items()})
+    merged.mlp_input_dimensions.update({k + off: v for k, v in dec_sched.slicing_conf.mlp_input_dimensions.items()})
+    merged.mlp_output_dimensions.update({k + off: v for k, v in dec_sched.slicing_conf.mlp_output_dimensions.items()})
+
+    merged.head_dimension = dec_sched.slicing_conf.head_dimension
+    merged.const_dimension = getattr(slicing_scheduler.slicing_conf, "const_dimension", None)
+
+    model_adapter.slicing_conf = merged.clone()

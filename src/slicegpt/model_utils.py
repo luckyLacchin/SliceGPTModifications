@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
@@ -12,8 +13,6 @@ from . import utils
 from .config import config
 from .model_adapter import LayerAdapter, ModelAdapter
 
-
-from __future__ import annotations
 
 from transformers.modeling_outputs import BaseModelOutput
 
