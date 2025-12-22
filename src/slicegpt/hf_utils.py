@@ -98,7 +98,7 @@ def get_model_and_tokenizer(
     )
 
     model = model_adapter.model
-    model.seqlen = model.config.max_position_embeddings
+    model.seqlen = _infer_seqlen(model, tokenizer)
     model.eval()  # This switches off dropout.
     model_adapter.use_cache = False
 
@@ -177,3 +177,28 @@ def load_sliced_model(
     model_adapter.model.eval()
 
     return model_adapter, tokenizer
+
+
+def _infer_seqlen(model, tokenizer=None, default=512) -> int:
+    cfg = getattr(model, "config", None)
+
+    # Common for decoder-only (OPT/GPT)
+    if cfg is not None and hasattr(cfg, "max_position_embeddings"):
+        v = getattr(cfg, "max_position_embeddings")
+        if v is not None:
+            return int(v)
+
+    # Common for T5-like / seq2seq configs
+    if cfg is not None and hasattr(cfg, "n_positions"):
+        v = getattr(cfg, "n_positions")
+        if v is not None:
+            return int(v)
+
+    # Last resort: tokenizer limit (works well for T5)
+    if tokenizer is not None:
+        v = getattr(tokenizer, "model_max_length", None)
+        # HF sometimes sets a huge sentinel like 1e30 for "infinite"
+        if v is not None and v < 10**9:
+            return int(v)
+
+    return int(default)
