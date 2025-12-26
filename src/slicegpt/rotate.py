@@ -1026,3 +1026,4 @@ def rotate_and_slice_seq2seq(
     rotate_head(model_adapter, Q_dec)
     if dec_sched.do_slice_head:
         slice_head(model_adapter, dec_sched.get_head_dimension())
+    model_adapter.slicing_conf = dec_sched.slicing_conf.clone() # update model's slicing config
