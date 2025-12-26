@@ -180,8 +180,8 @@ def slicing_main(args: argparse.Namespace) -> None:
     test_loader = data_utils.prepare_test_dataloader(
         dataset=test_dataset,
         tokenizer=tokenizer,
-        seqlen=args.seqlen,
-        batch_size=args.batch_size,
+        seqlen=args.ppl_eval_seqlen,
+        batch_size=args.ppl_eval_batch_size,
     )
 
 
@@ -233,7 +233,7 @@ def slicing_main(args: argparse.Namespace) -> None:
     )
 
     slicing_scheduler = ConstSlicingScheduler(new_embedding_dimension)
-        # Rotate + slice
+    # Rotate + slice
     # For seq2seq models (e.g., FLAN-T5) we must slice encoder+decoder with cross-attention.
     if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
         rotate.rotate_and_slice_seq2seq(

@@ -82,12 +82,13 @@ def get_model_and_tokenizer(
         model_path = model_name
 
     logging.info(
-        f"Loading %s config %s from %s",
+        "Loading %s config %s from %s",
         model_name,
         "and model weights" if not uninitialized else "",
-        model_path if local_model else 'Hugging Face',
+        model_path if local_model else "Hugging Face",
     )
 
+    # 1) Load model (adapter decides correct class)
     model_adapter = ModelAdapter.from_model(
         model_name,
         model_path=model_path,
@@ -97,16 +98,28 @@ def get_model_and_tokenizer(
         token=token,
     )
 
+    # 2) Load tokenizer BEFORE using it
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=True,
+        token=token,
+        local_files_only=local_model,
+    )
+
+    # Optional: avoid huge sentinel model_max_length values breaking seq len logic
+    if getattr(tokenizer, "model_max_length", None) is not None and tokenizer.model_max_length > 10**9:
+        tokenizer.model_max_length = 512
+
+    # 3) Set seqlen safely (T5 doesn't have max_position_embeddings)
     model = model_adapter.model
     model.seqlen = _infer_seqlen(model, tokenizer)
-    model.eval()  # This switches off dropout.
+    model.eval()  # switches off dropout
     model_adapter.use_cache = False
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token, local_files_only=local_model)
-
+    # 4) Adapter-specific post init (may register hooks, set pads, etc.)
     model_adapter.post_init(tokenizer)
-    logging.info("Loading model done")
 
+    logging.info("Loading model done")
     return model_adapter, tokenizer
 
 
