@@ -19,8 +19,28 @@ from transformers.models.t5.modeling_t5 import (
     T5ForConditionalGeneration,
     T5LayerNorm,
 )
-
+from typing import Sequence, Any
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
+import inspect
+import copy
+
+
+# ============================================================
+# Helpers: call modules with only supported kwargs (HF-version-proof)
+# ============================================================
+
+def _filter_kwargs_for_forward(mod: Module, kwargs: dict[str, Any]) -> dict[str, Any]:
+    sig = inspect.signature(mod.forward)
+    allowed = sig.parameters.keys()
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
+def _call_attn(attn_mod: Module, first_arg: Tensor, /, **kwargs):
+    """
+    Call T5Attention (or similar) robustly across Transformers versions.
+    Uses positional first arg, filters kwargs to match attn_mod.forward signature.
+    """
+    filtered = _filter_kwargs_for_forward(attn_mod, kwargs)
+    return attn_mod(first_arg, **filtered)
 
 
 # ----------------------------
@@ -28,18 +48,6 @@ from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 # ----------------------------
 
 class CompressedT5Block(T5Block):
-    """
-    T5Block with shortcut rotations for SliceGPT slicing.
-
-    We replicate the residual-add logic of T5LayerSelfAttention / T5LayerCrossAttention / T5LayerFF
-    so that we can rotate the residual branch before addition.
-
-    Buffers registered by ModelAdapter.convert_layer_to_compressed_and_register_buffers():
-      - attn_shortcut_Q
-      - cross_attn_shortcut_Q (decoder only)
-      - mlp_shortcut_Q
-    """
-
     def forward(
         self,
         hidden_states: Tensor,
@@ -48,40 +56,44 @@ class CompressedT5Block(T5Block):
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         encoder_decoder_position_bias=None,
-        past_key_values=None,
+        layer_head_mask=None,
+        cross_attn_layer_head_mask=None,
+        past_key_value=None,
+        past_key_values=None,   # keep for backward compat with your current calls
         use_cache: bool = False,
         output_attentions: bool = False,
         return_dict: bool = True,
         cache_position=None,
+        **kwargs,               # swallow extra HF kwargs safely
     ):
+        # HF has used both names across versions; pick whichever is provided.
+        pkv = past_key_value if past_key_value is not None else past_key_values
+
         # ---- Self-attention sublayer (layer[0]) ----
-        # Original T5LayerSelfAttention:
-        # normed = ln(hidden_states)
-        # attn_out = SelfAttention(normed, ...)
-        # hidden_states = hidden_states + dropout(attn_out[0])
-        # outputs = (hidden_states,) + attn_out[1:]
         sa = self.layer[0]
         residual = hidden_states
 
         normed = sa.layer_norm(hidden_states)
-        attn_out = sa.SelfAttention(
+        # Call attention with only supported kwargs
+        attn_out = _call_attn(
+            sa.SelfAttention,
             normed,
             mask=attention_mask,
             position_bias=position_bias,
-            past_key_values=past_key_values,
+            past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            layer_head_mask=layer_head_mask,
             cache_position=cache_position,
         )
         attn_hidden = sa.dropout(attn_out[0])
 
         if getattr(self, "attn_shortcut_Q", None) is not None:
-            residual = torch.matmul(residual, self.attn_shortcut_Q)
+            residual = torch.matmul(residual, self.attn_shortcut_Q.to(device=residual.device, dtype=residual.dtype))
         hidden_states = residual + attn_hidden
 
-        attention_outputs = attn_out[1:]  # position bias, attn weights, (maybe present_key_value)
+        attention_outputs = attn_out[1:]
 
-        # clamp inf values to enable fp16 training (copied from HF)
         if hidden_states.dtype == torch.float16:
             clamp_value = torch.where(
                 torch.isinf(hidden_states).any(),
@@ -97,22 +109,44 @@ class CompressedT5Block(T5Block):
             residual = hidden_states
 
             normed = ca.layer_norm(hidden_states)
-            cross_out = ca.EncDecAttention(
+            cross_out = _call_attn(
+                ca.EncDecAttention,
                 normed,
                 mask=encoder_attention_mask,
                 key_value_states=encoder_hidden_states,
                 position_bias=encoder_decoder_position_bias,
-                past_key_values=past_key_values,
+                past_key_value=past_key_value,
                 use_cache=use_cache,
-                query_length=cache_position[-1] + 1 if cache_position is not None else None,
                 output_attentions=output_attentions,
+                layer_head_mask=cross_attn_layer_head_mask,
                 cache_position=cache_position,
+                # Some HF versions accept query_length; harmless if filtered out
+                query_length=(cache_position[-1] + 1) if cache_position is not None else None,
             )
             cross_hidden = ca.dropout(cross_out[0])
 
-            if getattr(self, "cross_attn_shortcut_Q", None) is not None:
-                residual = torch.matmul(residual, self.cross_attn_shortcut_Q)
-            hidden_states = residual + cross_hidden
+            # --- Cross-attn residual shortcut (robust to intermediate rotate/slice states)
+            Q = getattr(self, "cross_attn_shortcut_Q", None)
+            residual_p = residual
+            if Q is not None:
+                Qd = Q.to(device=residual.device, dtype=residual.dtype)
+                # Try to apply as (in -> out). Handle both possible stored orientations.
+                if residual.shape[-1] == Qd.shape[0]:
+                    residual_p = torch.matmul(residual, Qd)
+                elif residual.shape[-1] == Qd.shape[1]:
+                    residual_p = torch.matmul(residual, Qd.transpose(0, 1))
+            
+            # Ensure cross_hidden matches residual_p dim so the add is valid even mid-slice.
+            if cross_hidden.shape[-1] != residual_p.shape[-1]:
+                if cross_hidden.shape[-1] > residual_p.shape[-1]:
+                    # keep leading dims only (temporary during slicing)
+                    cross_hidden = cross_hidden[..., : residual_p.shape[-1]]
+                else:
+                    # pad with zeros (rare, but keeps shapes consistent)
+                    pad = residual_p.shape[-1] - cross_hidden.shape[-1]
+                    cross_hidden = torch.nn.functional.pad(cross_hidden, (0, pad))
+            
+            hidden_states = residual_p + cross_hidden
 
             if hidden_states.dtype == torch.float16:
                 clamp_value = torch.where(
@@ -133,7 +167,7 @@ class CompressedT5Block(T5Block):
         ff_out = ff.dropout(ff_out)
 
         if getattr(self, "mlp_shortcut_Q", None) is not None:
-            residual = torch.matmul(residual, self.mlp_shortcut_Q)
+            residual = torch.matmul(residual, self.mlp_shortcut_Q.to(device=residual.device, dtype=residual.dtype))
         hidden_states = residual + ff_out
 
         if hidden_states.dtype == torch.float16:
@@ -146,6 +180,7 @@ class CompressedT5Block(T5Block):
 
         outputs = (hidden_states,)
         return outputs + attention_outputs
+
 
 
 # ----------------------------
@@ -201,6 +236,26 @@ class T5BlockLayerAdapter(LayerAdapter):
     def get_mlp_output(self) -> Linear:
         drd = self._layer.layer[-1].DenseReluDense
         return drd.wo
+    
+    # ----------------------------
+    # Cross-attention (encoder: none)
+    # These exist only to satisfy LayerAdapter abstract interface.
+    # ----------------------------
+    def has_cross_attention(self) -> bool:
+        return False
+
+    def get_cross_attention_layernorm(self) -> Module:
+        raise RuntimeError("Encoder T5Block has no cross-attention.")
+
+    def get_cross_attention_q_input(self) -> Linear:
+        raise RuntimeError("Encoder T5Block has no cross-attention.")
+
+    def get_cross_attention_kv_inputs(self) -> Sequence[Linear]:
+        raise RuntimeError("Encoder T5Block has no cross-attention.")
+
+    def get_cross_attention_output(self) -> Linear:
+        raise RuntimeError("Encoder T5Block has no cross-attention.")
+
 
 
 class T5DecoderBlockLayerAdapter(T5BlockLayerAdapter):
@@ -230,6 +285,10 @@ class T5DecoderBlockLayerAdapter(T5BlockLayerAdapter):
             raise RuntimeError("Cross-attention o requested on a non-decoder T5Block")
         ca = self._layer.layer[1].EncDecAttention
         return ca.o
+    
+    def has_cross_attention(self) -> bool:
+        return True
+
 
 
 # ----------------------------
@@ -360,17 +419,33 @@ class T5ModelAdapter(ModelAdapter):
         if not isinstance(layer, T5Block):
             raise TypeError(f"Expected T5Block, got {type(layer)}")
 
-        # T5Block signature: (config, has_relative_attention_bias=False, layer_idx=None)
-        # The first block in each stack may have relative attention bias.
-        # We preserve this by reading whether the original block's self-attn has it.
+        # Detect relative position bias in the self-attention sublayer
         has_rpb = bool(getattr(layer.layer[0].SelfAttention, "has_relative_attention_bias", False))
 
-        compressed = self.compressed_layer_type(self.config, has_relative_attention_bias=has_rpb, layer_idx=layer_idx)
+        # IMPORTANT: T5Block structure depends on config.is_decoder.
+        # If we build with is_decoder=False, we get encoder-style (no cross-attn).
+        # If we build with is_decoder=True, we get decoder-style (with cross-attn).
+        cfg = copy.deepcopy(self.config)
+        cfg.is_decoder = bool(layer.is_decoder)
+        # (Usually already true for T5; harmless if set)
+        cfg.is_encoder_decoder = True
+
+        ctor = self.compressed_layer_type
+        sig = inspect.signature(ctor.__init__)
+        params = sig.parameters
+
+        kwargs = {"has_relative_attention_bias": has_rpb}
+        if "layer_idx" in params:
+            kwargs["layer_idx"] = layer_idx
+
+        compressed = ctor(cfg, **kwargs)
+
+        # Now state_dict layouts match (encoder vs decoder)
         compressed.load_state_dict(layer.state_dict(), strict=True)
 
-        # preserve decoder flag
-        compressed.is_decoder = layer.is_decoder
         return compressed
+
+
 
     # ---- embeddings / head ----
     
