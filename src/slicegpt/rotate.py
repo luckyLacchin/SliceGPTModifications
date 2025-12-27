@@ -104,12 +104,65 @@ def rotate_embeddings(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
     # Run GC and cleanup GPU memory
     cleanup_memory()
 
-
+''''
 def slice_embeddings(model_adapter: ModelAdapter, new_embedding_dimensions: dict[int, int]) -> None:
     # Slice the embeddings.
     for i, W in enumerate(model_adapter.get_embeddings()):
         W.weight.data = W.weight.data[:, : new_embedding_dimensions[i]]
         W.embedding_dim = new_embedding_dimensions[i]
+'''       
+        
+def slice_embeddings(model_adapter, new_embedding_dimensions):
+    embeddings = list(model_adapter.get_embeddings())
+    if not embeddings:
+        return
+
+    # --- Case 1: list/tuple (original expected format) ---
+    if isinstance(new_embedding_dimensions, (list, tuple)):
+        dims = list(new_embedding_dimensions)
+
+    # --- Case 2: dict-like ---
+    elif isinstance(new_embedding_dimensions, dict):
+        # If it has integer keys 0..N-1, use them (original behavior)
+        if all(i in new_embedding_dimensions for i in range(len(embeddings))):
+            dims = [new_embedding_dimensions[i] for i in range(len(embeddings))]
+        else:
+            # Fallback ONLY to avoid KeyError:
+            # infer target dim from slicing_conf (works for T5 reloads)
+            sc = getattr(model_adapter, "slicing_conf", None)
+            inferred = None
+
+            # Prefer a known post-slice dimension:
+            if sc is not None:
+                # attention_input_dimensions is typically {layer_idx: dim}
+                aid = getattr(sc, "attention_input_dimensions", None)
+                if isinstance(aid, dict) and len(aid) > 0:
+                    inferred = next(iter(aid.values()))
+                # or const_dimension if present
+                if inferred is None:
+                    inferred = getattr(sc, "const_dimension", None)
+
+            if inferred is None:
+                raise ValueError(
+                    "Cannot infer embedding dimension (embedding_dimensions dict has no "
+                    "0..N-1 keys and slicing_conf missing)."
+                )
+
+            # If single embedding (T5 shared), apply inferred dim to it.
+            # If multiple embeddings, apply same inferred dim to all (reasonable default).
+            dims = [int(inferred)] * len(embeddings)
+
+    else:
+        raise TypeError(f"Unsupported embedding dimension type: {type(new_embedding_dimensions)}")
+
+    # Sanity check
+    if len(dims) != len(embeddings):
+        raise ValueError(f"Got {len(dims)} embedding dims for {len(embeddings)} embeddings: {dims}")
+
+    for W, d in zip(embeddings, dims):
+        W.weight.data = W.weight.data[:, :d]
+        W.embedding_dim = d
+
 
 
 def rotate_head(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
@@ -459,13 +512,154 @@ def rotate(model_adapter: ModelAdapter, dataloader: torch.utils.data.DataLoader[
 
 def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingScheduler | None = None) -> None:
     """
-    TODO: Make this gpu memory efficient.
+    Slice a rotated model based on its slicing configuration.
+
+    Supports:
+      - decoder-only models
+      - seq2seq models (e.g., T5/FLAN-T5) by slicing encoder and decoder separately
+
+    IMPORTANT:
+      For seq2seq configs, decoder layer indices may be stored either:
+        (A) separate: encoder 0..E-1, decoder 0..D-1
+        (B) offset : encoder 0..E-1, decoder E..E+D-1
+      This function auto-detects which one you have and slices accordingly.
     """
     model_adapter.model.eval()
+
+    # -----------------------------
+    # Helper: detect decoder indexing scheme
+    # -----------------------------
+    def _max_int_key(d: object) -> int | None:
+        if isinstance(d, dict) and d:
+            ks = [k for k in d.keys() if isinstance(k, int)]
+            return max(ks) if ks else None
+        return None
+
+    def _len_if_sequence(x: object) -> int | None:
+        if isinstance(x, (list, tuple)):
+            return len(x)
+        return None
+
+    def _decoder_is_offset(conf, E: int, D: int) -> bool:
+        cand = getattr(conf, "attention_input_dimensions", None)
+
+        m = _max_int_key(cand)
+        if m is not None:
+            return m >= E
+
+        L = _len_if_sequence(cand)
+        if L is not None:
+            return L >= (E + D)
+
+        return False  # safest default
+
+    # -----------------------------
+    # Seq2Seq (T5-like) path
+    # -----------------------------
+    is_seq2seq = getattr(model_adapter.config, "is_encoder_decoder", False) and hasattr(model_adapter, "get_encoder_layers")
+    if is_seq2seq:
+        enc_layers = model_adapter.get_encoder_layers()
+        dec_layers = model_adapter.get_decoder_layers()
+        E = len(enc_layers)
+        D = len(dec_layers)
+
+        # Build scheduler if not provided
+        if slicing_scheduler is None:
+            if model_adapter.slicing_conf.const_dimension is not None:
+                slicing_scheduler = ConstSlicingScheduler(model_adapter.slicing_conf.const_dimension)
+                slicing_scheduler.setup(
+                    hidden_size=model_adapter.hidden_size,
+                    layers_num=E + D,
+                    parallel_blocks=model_adapter.parallel_blocks,
+                )
+            else:
+                slicing_scheduler = ConfigSlicingScheduler(model_adapter.slicing_conf)
+
+        decoder_is_offset = _decoder_is_offset(model_adapter.slicing_conf, E=E, D=D)
+
+        # Slice embeddings (shared)
+        slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+
+        # -----------------------------
+        # Slice encoder layers (0..E-1)
+        # -----------------------------
+        for i, layer_adapter in enumerate(enc_layers):
+            layer = layer_adapter.layer
+
+            d_attn_in  = slicing_scheduler.get_attention_input_dimension(i)
+            d_attn_out = slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)
+            d_mlp_in   = slicing_scheduler.get_mlp_input_dimension(i)
+            d_mlp_out  = slicing_scheduler.get_mlp_output_dimension(i)
+
+            # projections
+            slice_attention_inputs(layer_adapter, d_attn_in)
+            slice_attention_output(layer_adapter, d_attn_out)
+
+            slice_mlp_input(layer_adapter, d_mlp_in)
+            slice_mlp_output(layer_adapter, d_mlp_out)
+
+            # shortcuts: MUST be [in_dim, out_dim]
+            if getattr(layer, "attn_shortcut_Q", None) is not None:
+                layer.attn_shortcut_Q = nn.Parameter(layer.attn_shortcut_Q[:d_attn_in, :d_attn_out])
+
+            if getattr(layer, "mlp_shortcut_Q", None) is not None:
+                layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:d_mlp_in, :d_mlp_out])
+
+        # Encoder output dim becomes KV dim for decoder cross-attn
+        enc_out_dim = slicing_scheduler.get_mlp_output_dimension(E - 1)
+
+        # -----------------------------
+        # Slice decoder layers
+        #   if offset: idx = E + j
+        #   else    : idx = j
+        # -----------------------------
+        for j, layer_adapter in enumerate(dec_layers):
+            layer = layer_adapter.layer
+            idx = (E + j) if decoder_is_offset else j
+
+            d_attn_in  = slicing_scheduler.get_attention_input_dimension(idx)
+            d_attn_out = slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+            d_mlp_in   = slicing_scheduler.get_mlp_input_dimension(idx)
+            d_mlp_out  = slicing_scheduler.get_mlp_output_dimension(idx)
+
+            # self-attn
+            slice_attention_inputs(layer_adapter, d_attn_in)
+            slice_attention_output(layer_adapter, d_attn_out)
+
+            # cross-attn:
+            # - Q takes decoder stream (use d_attn_out)
+            # - K/V take encoder output stream (enc_out_dim)
+            slice_cross_attention_inputs(layer_adapter, new_q_dim=d_attn_out, new_kv_dim=enc_out_dim)
+            slice_cross_attention_output(layer_adapter, d_mlp_in)
+
+            # mlp
+            slice_mlp_input(layer_adapter, d_mlp_in)
+            slice_mlp_output(layer_adapter, d_mlp_out)
+
+            # shortcuts: MUST be [in_dim, out_dim]
+            if getattr(layer, "attn_shortcut_Q", None) is not None:
+                layer.attn_shortcut_Q = nn.Parameter(layer.attn_shortcut_Q[:d_attn_in, :d_attn_out])
+
+            if getattr(layer, "cross_attn_shortcut_Q", None) is not None:
+                # residual before cross-attn is in d_attn_out, output goes into d_mlp_in
+                layer.cross_attn_shortcut_Q = nn.Parameter(layer.cross_attn_shortcut_Q[:d_attn_out, :d_mlp_in])
+
+            if getattr(layer, "mlp_shortcut_Q", None) is not None:
+                layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:d_mlp_in, :d_mlp_out])
+
+        # Slice head (if requested)
+        if slicing_scheduler.do_slice_head:
+            slice_head(model_adapter, slicing_scheduler.get_head_dimension())
+
+        return
+
+    # -----------------------------
+    # Decoder-only path (unchanged)
+    # -----------------------------
     layers = model_adapter.get_layers()
-    if not slicing_scheduler:
+
+    if slicing_scheduler is None:
         if model_adapter.slicing_conf.const_dimension is not None:
-            # backward compatibility for when no config is available
             slicing_scheduler = ConstSlicingScheduler(model_adapter.slicing_conf.const_dimension)
             slicing_scheduler.setup(
                 hidden_size=model_adapter.hidden_size,
@@ -475,48 +669,37 @@ def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingS
         else:
             slicing_scheduler = ConfigSlicingScheduler(model_adapter.slicing_conf)
 
-    # slice embeddings
     slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
 
-    # slice layers
     for i, layer_adapter in enumerate(layers):
         layer = layer_adapter.layer
-        # slice attn weights 2nd dim, attn shortcut 1st dim
-        slice_attention_inputs(layer_adapter, slicing_scheduler.get_attention_input_dimension(i))
 
-        # slice mlp input 2nd dimension
+        slice_attention_inputs(layer_adapter, slicing_scheduler.get_attention_input_dimension(i))
         slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(i))
 
-        # slice mlp shortcut 1st dimension
-        # slice mlp shortcut
         if not model_adapter.parallel_blocks:
             layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[: slicing_scheduler.get_mlp_input_dimension(i), :])
 
-        # slice mlp weights 1st dimension
         slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(i))
 
-        if model_adapter.parallel_blocks:  # parallel case
+        if model_adapter.parallel_blocks:
             layer.attn_shortcut_Q = nn.Parameter(
                 layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True)]
             )
-            slice_attention_output(
-                layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True)
-            )
-        else:  # sequential case
+            slice_attention_output(layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True))
+        else:
             layer.attn_shortcut_Q = nn.Parameter(
                 layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)]
             )
             layer.mlp_shortcut_Q = nn.Parameter(
                 layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(i)]
             )
-
-            # slice attention weights 1st dimension
-            slice_attention_output(
-                layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)
-            )
+            slice_attention_output(layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False))
 
     if slicing_scheduler.do_slice_head:
         slice_head(model_adapter, slicing_scheduler.get_head_dimension())
+
+
 
 
 def random_orthogonal_upper_left(total_dim, upper_block_dim):

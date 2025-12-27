@@ -59,51 +59,171 @@ class CompressedT5Block(T5Block):
         layer_head_mask=None,
         cross_attn_layer_head_mask=None,
         past_key_value=None,
-        past_key_values=None,   # keep for backward compat with your current calls
+        past_key_values=None,   # backward compat
         use_cache: bool = False,
         output_attentions: bool = False,
-        return_dict: bool = True,
+        return_dict: bool = True,  # ignored; T5Block returns tuples
         cache_position=None,
         **kwargs,               # swallow extra HF kwargs safely
     ):
+        # ---------------------------
+        # Helpers
+        # ---------------------------
+        def _bias_tensor(b):
+            # Some wrappers accidentally keep bias as tuple; HF expects Tensor or None
+            if isinstance(b, tuple):
+                return b[0]
+            return b
+
+        def _maybe_clamp_fp16(x):
+            if x is not None and x.dtype == torch.float16:
+                # Prevent infs in fp16 (mimics HF behavior in some branches)
+                finfo = torch.finfo(x.dtype)
+                clamp_value = finfo.max
+                if torch.isinf(x).any():
+                    clamp_value = finfo.max - 1000
+                return torch.clamp(x, min=-clamp_value, max=clamp_value)
+            return x
+
+        def _apply_shortcut(residual, Q):
+            """
+            Apply learned shortcut projection Q to residual if present.
+            Q is expected as [in_dim, out_dim] but we handle transposed too.
+            """
+            if Q is None:
+                return residual
+            Qd = Q.to(device=residual.device, dtype=residual.dtype)
+
+            # Standard: residual[..., in] @ Q[in,out] -> residual[..., out]
+            if residual.shape[-1] == Qd.shape[0]:
+                return residual @ Qd
+
+            # If stored transposed: Q[out,in]
+            if residual.shape[-1] == Qd.shape[1]:
+                return residual @ Qd.transpose(0, 1)
+
+            # If dims don’t match, just return unchanged (safer than crashing mid-slice)
+            return residual
+
+        def _match_last_dim(x, target_dim: int):
+            """Force x last-dim to target_dim by slice/pad (safest during mid-slice)."""
+            if x.shape[-1] == target_dim:
+                return x
+            if x.shape[-1] > target_dim:
+                return x[..., :target_dim]
+            pad = target_dim - x.shape[-1]
+            return torch.nn.functional.pad(x, (0, pad))
+        
+        def _flatten_present_kv(self_kv, cross_kv):
+            """
+            Convert:
+            self_kv  = (k, v) or None
+            cross_kv = (k, v) or None
+            into HF T5 expected:
+            (self_k, self_v, cross_k, cross_v)
+            """
+            # Already flattened in some HF versions
+            if isinstance(self_kv, (tuple, list)) and len(self_kv) == 4:
+                return tuple(self_kv)
+
+            if self_kv is None:
+                sk = sv = None
+            else:
+                sk, sv = self_kv
+
+            if cross_kv is None:
+                ck = cv = None
+            else:
+                ck, cv = cross_kv
+
+            return (sk, sv, ck, cv)
+
         # HF has used both names across versions; pick whichever is provided.
         pkv = past_key_value if past_key_value is not None else past_key_values
 
-        # ---- Self-attention sublayer (layer[0]) ----
+        # Decoder pkv layout in HF T5 can be either:
+        #  - flat: (self_k, self_v, cross_k, cross_v)   [HF generation format]
+        #  - nested: ((self_k, self_v), (cross_k, cross_v))  [some custom wrappers]
+        #  - self-only: (self_k, self_v)
+        self_pkv = None
+        cross_pkv = None
+
+        if self.is_decoder and pkv is not None and isinstance(pkv, (tuple, list)):
+            if len(pkv) == 4:
+                # HF standard for T5 generation
+                self_pkv = (pkv[0], pkv[1])
+                cross_pkv = (pkv[2], pkv[3])
+            elif len(pkv) == 2:
+                # Could be nested ((k,v),(k,v)) OR self-only (k,v)
+                a, b = pkv[0], pkv[1]
+                if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)) and len(a) == 2 and len(b) == 2:
+                    # nested format
+                    self_pkv, cross_pkv = a, b
+                else:
+                    # self-only format
+                    self_pkv = (a, b)
+                    cross_pkv = None
+        else:
+            # encoder or no cache
+            self_pkv = pkv
+            cross_pkv = None
+
+
+        # Sanitize biases
+        position_bias = _bias_tensor(position_bias)
+        encoder_decoder_position_bias = _bias_tensor(encoder_decoder_position_bias)
+
+        # We'll collect these explicitly and then pack in correct order
+        self_present_kv = None
+        self_pos_bias = None
+        self_attn_w = None
+
+        cross_present_kv = None
+        cross_pos_bias = None
+        cross_attn_w = None
+
+        # ---------------------------
+        # 1) Self-attention (layer[0])
+        # ---------------------------
         sa = self.layer[0]
         residual = hidden_states
 
         normed = sa.layer_norm(hidden_states)
-        # Call attention with only supported kwargs
         attn_out = _call_attn(
             sa.SelfAttention,
             normed,
             mask=attention_mask,
             position_bias=position_bias,
-            past_key_value=past_key_value,
+            past_key_value=self_pkv,         # IMPORTANT: self pkv only
             use_cache=use_cache,
             output_attentions=output_attentions,
             layer_head_mask=layer_head_mask,
             cache_position=cache_position,
         )
+
         attn_hidden = sa.dropout(attn_out[0])
-
-        if getattr(self, "attn_shortcut_Q", None) is not None:
-            residual = torch.matmul(residual, self.attn_shortcut_Q.to(device=residual.device, dtype=residual.dtype))
+        residual = _apply_shortcut(residual, getattr(self, "attn_shortcut_Q", None))
+        residual = _match_last_dim(residual, attn_hidden.shape[-1])
         hidden_states = residual + attn_hidden
+        hidden_states = _maybe_clamp_fp16(hidden_states)
 
-        attention_outputs = attn_out[1:]
+        # Unpack self-attn outputs (HF T5Attention):
+        # (attn_output, present_kv, position_bias, attn_weights?) depending on flags
+        if len(attn_out) > 1:
+            self_present_kv = attn_out[1]
+        if len(attn_out) > 2:
+            self_pos_bias = _bias_tensor(attn_out[2])
+        if output_attentions and len(attn_out) > 3:
+            self_attn_w = attn_out[3]
 
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.where(
-                torch.isinf(hidden_states).any(),
-                torch.finfo(hidden_states.dtype).max - 1000,
-                torch.finfo(hidden_states.dtype).max,
-            )
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+        # Keep updated position_bias for next layer if provided
+        if self_pos_bias is not None:
+            position_bias = self_pos_bias
 
-        # ---- Cross-attention (decoder only, layer[1]) ----
-        do_cross_attention = self.is_decoder and encoder_hidden_states is not None
+        # ---------------------------
+        # 2) Cross-attention (decoder only, layer[1])
+        # ---------------------------
+        do_cross_attention = self.is_decoder and (encoder_hidden_states is not None)
         if do_cross_attention:
             ca = self.layer[1]
             residual = hidden_states
@@ -115,7 +235,7 @@ class CompressedT5Block(T5Block):
                 mask=encoder_attention_mask,
                 key_value_states=encoder_hidden_states,
                 position_bias=encoder_decoder_position_bias,
-                past_key_value=past_key_value,
+                past_key_value=cross_pkv,      # IMPORTANT: cross pkv only
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 layer_head_mask=cross_attn_layer_head_mask,
@@ -123,42 +243,29 @@ class CompressedT5Block(T5Block):
                 # Some HF versions accept query_length; harmless if filtered out
                 query_length=(cache_position[-1] + 1) if cache_position is not None else None,
             )
+
             cross_hidden = ca.dropout(cross_out[0])
 
-            # --- Cross-attn residual shortcut (robust to intermediate rotate/slice states)
-            Q = getattr(self, "cross_attn_shortcut_Q", None)
-            residual_p = residual
-            if Q is not None:
-                Qd = Q.to(device=residual.device, dtype=residual.dtype)
-                # Try to apply as (in -> out). Handle both possible stored orientations.
-                if residual.shape[-1] == Qd.shape[0]:
-                    residual_p = torch.matmul(residual, Qd)
-                elif residual.shape[-1] == Qd.shape[1]:
-                    residual_p = torch.matmul(residual, Qd.transpose(0, 1))
-            
-            # Ensure cross_hidden matches residual_p dim so the add is valid even mid-slice.
-            if cross_hidden.shape[-1] != residual_p.shape[-1]:
-                if cross_hidden.shape[-1] > residual_p.shape[-1]:
-                    # keep leading dims only (temporary during slicing)
-                    cross_hidden = cross_hidden[..., : residual_p.shape[-1]]
-                else:
-                    # pad with zeros (rare, but keeps shapes consistent)
-                    pad = residual_p.shape[-1] - cross_hidden.shape[-1]
-                    cross_hidden = torch.nn.functional.pad(cross_hidden, (0, pad))
-            
-            hidden_states = residual_p + cross_hidden
+            residual = _apply_shortcut(residual, getattr(self, "cross_attn_shortcut_Q", None))
+            residual = _match_last_dim(residual, cross_hidden.shape[-1])
+            hidden_states = residual + cross_hidden
+            hidden_states = _maybe_clamp_fp16(hidden_states)
 
-            if hidden_states.dtype == torch.float16:
-                clamp_value = torch.where(
-                    torch.isinf(hidden_states).any(),
-                    torch.finfo(hidden_states.dtype).max - 1000,
-                    torch.finfo(hidden_states.dtype).max,
-                )
-                hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+            # Unpack cross-attn outputs
+            if len(cross_out) > 1:
+                cross_present_kv = cross_out[1]
+            if len(cross_out) > 2:
+                cross_pos_bias = _bias_tensor(cross_out[2])
+            if output_attentions and len(cross_out) > 3:
+                cross_attn_w = cross_out[3]
 
-            attention_outputs = attention_outputs + cross_out[1:]
+            # Keep updated encoder_decoder_position_bias for next layer
+            if cross_pos_bias is not None:
+                encoder_decoder_position_bias = cross_pos_bias
 
-        # ---- Feed-forward (layer[-1]) ----
+        # ---------------------------
+        # 3) Feed-forward (layer[-1])
+        # ---------------------------
         ff = self.layer[-1]
         residual = hidden_states
 
@@ -166,20 +273,45 @@ class CompressedT5Block(T5Block):
         ff_out = ff.DenseReluDense(ff_in)
         ff_out = ff.dropout(ff_out)
 
-        if getattr(self, "mlp_shortcut_Q", None) is not None:
-            residual = torch.matmul(residual, self.mlp_shortcut_Q.to(device=residual.device, dtype=residual.dtype))
+        residual = _apply_shortcut(residual, getattr(self, "mlp_shortcut_Q", None))
+        residual = _match_last_dim(residual, ff_out.shape[-1])
         hidden_states = residual + ff_out
+        hidden_states = _maybe_clamp_fp16(hidden_states)
 
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.where(
-                torch.isinf(hidden_states).any(),
-                torch.finfo(hidden_states.dtype).max - 1000,
-                torch.finfo(hidden_states.dtype).max,
-            )
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+        # ---------------------------
+        # Pack outputs EXACTLY like HF T5Block
+        # ---------------------------
+        out = (hidden_states,)
 
-        outputs = (hidden_states,)
-        return outputs + attention_outputs
+        if self.is_decoder:
+            # present_key_value must be ONE object: (self_kv, cross_kv)
+            if use_cache:
+                present_key_value = _flatten_present_kv(self_present_kv, cross_present_kv)
+                out = out + (present_key_value,)
+
+            # then self-attn position bias
+            out = out + (position_bias,)
+
+            if output_attentions:
+                out = out + (self_attn_w,)
+
+            # then cross-attn position bias (if cross-attn ran)
+            if do_cross_attention:
+                out = out + (encoder_decoder_position_bias,)
+                if output_attentions:
+                    out = out + (cross_attn_w,)
+        else:
+            # encoder block: no cross-attn
+            if use_cache:
+                # encoder cache is just self kv
+                out = out + (self_present_kv,)
+
+            out = out + (position_bias,)
+            if output_attentions:
+                out = out + (self_attn_w,)
+
+        return out
+
 
 
 

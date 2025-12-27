@@ -153,8 +153,17 @@ def load_sliced_model(
     replace_layers(model_adapter)
     fuse_modules(model_adapter)
 
+    # Replace the section that initializes shortcut matrices (around lines 169-180)
+
     hidden_size = model_adapter.hidden_size
-    for layer_adapter in model_adapter.get_layers():
+
+    # Initialize encoder layer shortcuts
+    encoder_layers = (
+        model_adapter.get_encoder_layers()
+        if hasattr(model_adapter, "get_encoder_layers")
+        else model_adapter.get_layers()
+    )
+    for layer_adapter in encoder_layers:
         if not model_adapter.parallel_blocks:
             layer_adapter.layer.mlp_shortcut_Q = torch.nn.Parameter(
                 torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
@@ -162,6 +171,21 @@ def load_sliced_model(
         layer_adapter.layer.attn_shortcut_Q = torch.nn.Parameter(
             torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
         )
+
+    # Initialize decoder layer shortcuts (for seq2seq models like T5)
+    if hasattr(model_adapter, "get_decoder_layers"):
+        decoder_layers = model_adapter.get_decoder_layers()
+        for layer_adapter in decoder_layers:
+            layer_adapter.layer.mlp_shortcut_Q = torch.nn.Parameter(
+                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
+            )
+            layer_adapter.layer.attn_shortcut_Q = torch.nn.Parameter(
+                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
+            )
+            # T5 decoder has cross-attention
+            layer_adapter.layer.cross_attn_shortcut_Q = torch.nn.Parameter(
+                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
+            )
 
     config_path = pathlib.Path(sliced_model_path) / my_sliced_model_config
 
@@ -215,3 +239,6 @@ def _infer_seqlen(model, tokenizer=None, default=512) -> int:
             return int(v)
 
     return int(default)
+
+
+
