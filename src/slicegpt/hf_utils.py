@@ -134,16 +134,21 @@ def load_sliced_model(
     round_interval: int | None = 1,
 ) -> tuple[ModelAdapter, PreTrainedTokenizerBase]:
     """
-    Load the sliced model and the tokenizer from the given path. If lora_config: peft.LoraConfig is supplied
-    as an arg then this function will return a PEFT model (post-slicing finetuned model). Despite being declared as
-    "Any", lora_config is supposed to have the type peft.LoraConfig. It has type "Any" in the function's signature,
-    so that it would be possible to use it without taking a dependency on peft, when one is not required.
-    The corresponding model adapter class must be imported before calling this method.
+    Load a sliced model + tokenizer from `sliced_model_path`.
+    Fixed to handle T5 cross-attention K/V weights that may be stored at full dimension.
     """
-    my_model_suffix = pathlib.Path(model_name).name
-    my_sliced_model_name = f"{my_model_suffix}_{sparsity}.pt"
-    my_sliced_model_config = f"{my_model_suffix}_{sparsity}.json"
+    import pathlib
+    import torch
+    import logging
 
+    if sparsity is None:
+        raise ValueError("sparsity must be provided to locate checkpoint/config names.")
+
+    my_model_suffix = pathlib.Path(model_name).name
+    my_ckpt_name = f"{my_model_suffix}_{sparsity}.pt"
+    my_cfg_name  = f"{my_model_suffix}_{sparsity}.json"
+
+    # 1) uninitialized skeleton
     model_adapter, tokenizer = get_model_and_tokenizer(
         model_name,
         model_path=sliced_model_path,
@@ -153,65 +158,153 @@ def load_sliced_model(
     replace_layers(model_adapter)
     fuse_modules(model_adapter)
 
-    # Replace the section that initializes shortcut matrices (around lines 169-180)
+    orig_dim = int(model_adapter.hidden_size)
 
-    hidden_size = model_adapter.hidden_size
-
-    # Initialize encoder layer shortcuts
-    encoder_layers = (
-        model_adapter.get_encoder_layers()
-        if hasattr(model_adapter, "get_encoder_layers")
-        else model_adapter.get_layers()
-    )
-    for layer_adapter in encoder_layers:
-        if not model_adapter.parallel_blocks:
-            layer_adapter.layer.mlp_shortcut_Q = torch.nn.Parameter(
-                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
-            )
-        layer_adapter.layer.attn_shortcut_Q = torch.nn.Parameter(
-            torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
-        )
-
-    # Initialize decoder layer shortcuts (for seq2seq models like T5)
-    if hasattr(model_adapter, "get_decoder_layers"):
-        decoder_layers = model_adapter.get_decoder_layers()
-        for layer_adapter in decoder_layers:
-            layer_adapter.layer.mlp_shortcut_Q = torch.nn.Parameter(
-                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
-            )
-            layer_adapter.layer.attn_shortcut_Q = torch.nn.Parameter(
-                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
-            )
-            # T5 decoder has cross-attention
-            layer_adapter.layer.cross_attn_shortcut_Q = torch.nn.Parameter(
-                torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
-            )
-
-    config_path = pathlib.Path(sliced_model_path) / my_sliced_model_config
-
-    if config_path.exists():
-        model_adapter.slicing_conf = SlicingConfig.from_json_string(config_path.read_text())
+    # 2) load/derive slicing_conf
+    cfg_path = pathlib.Path(sliced_model_path) / my_cfg_name
+    if cfg_path.exists():
+        model_adapter.slicing_conf = SlicingConfig.from_json_string(cfg_path.read_text())
+    else:
+        model_adapter.slicing_conf = None
 
     if model_adapter.slicing_conf is None:
-        # assume the model was sliced with the const sparsity specified in the arguments to this method
-        new_embedding_dimension = int((1 - sparsity) * hidden_size)
-        new_embedding_dimension -= new_embedding_dimension % round_interval
-        config = SlicingConfig()
-        config.const_dimension = new_embedding_dimension
-        model_adapter.slicing_conf = config
+        target_dim = int((1.0 - float(sparsity)) * orig_dim)
+        target_dim -= target_dim % int(round_interval or 1)
+        sc = SlicingConfig()
+        sc.const_dimension = target_dim
+        model_adapter.slicing_conf = sc
+    else:
+        if model_adapter.slicing_conf.const_dimension is None:
+            raise ValueError("slicing_conf exists but const_dimension is None.")
+        target_dim = int(model_adapter.slicing_conf.const_dimension)
 
+    # 3) slice skeleton
     slice_rotated_model(model_adapter)
+    model = model_adapter.model
 
+    # 4) enforce T5 invariant: lm_head tied to shared
+    if hasattr(model, "shared") and hasattr(model, "lm_head"):
+        d = int(model.shared.weight.shape[1])
+        if model.lm_head.weight.shape[1] != d:
+            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.data[:, :d].contiguous())
+            model.lm_head.in_features = d
+        model.lm_head.weight = model.shared.weight
+
+    # 5) optional LoRA
     if lora_config:
         from peft import get_peft_model
-
         model_adapter.model = get_peft_model(model_adapter.model, lora_config)
+        model = model_adapter.model
+
+    # 6) load checkpoint
+    ckpt_path = pathlib.Path(sliced_model_path) / my_ckpt_name
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     logging.info(f"Loading sliced model weights from {sliced_model_path}")
-    model_adapter.model.load_state_dict(
-        torch.load(str(pathlib.Path(sliced_model_path) / my_sliced_model_name), map_location="cpu")
-    )
-    model_adapter.model.eval()
+    state = torch.load(str(ckpt_path), map_location="cpu")
+
+    # drop shortcut_Q keys
+    shortcut_suffixes = ("attn_shortcut_Q", "mlp_shortcut_Q", "cross_attn_shortcut_Q")
+    for k in [k for k in list(state.keys()) if k.endswith(shortcut_suffixes)]:
+        state.pop(k, None)
+
+    # 7) FIX: Handle cross-attention K/V weights specially for T5
+    # These may be stored at full encoder dimension (768) but model expects sliced encoder output dim
+    model_state = model.state_dict()
+    cross_attn_kv_keys = []
+    for k in state.keys():
+        # Match decoder cross-attention K/V weights
+        if "decoder.block" in k and "layer.1.EncDecAttention" in k and (".k.weight" in k or ".v.weight" in k):
+            cross_attn_kv_keys.append(k)
+    
+    # Determine encoder final dimension from actual model state
+    enc_final_dim = target_dim  # default fallback
+    
+    # Method 1: Check what dimension the decoder cross-attn K/V actually expect
+    if cross_attn_kv_keys and cross_attn_kv_keys[0] in model_state:
+        enc_final_dim = int(model_state[cross_attn_kv_keys[0]].shape[1])
+        logging.info(f"Detected encoder output dimension: {enc_final_dim} from model skeleton")
+    
+    # Method 2: Fallback to slicing_conf if available
+    elif model_adapter.slicing_conf and hasattr(model_adapter.slicing_conf, "mlp_output_dimensions"):
+        mlp_out = model_adapter.slicing_conf.mlp_output_dimensions
+        if mlp_out and isinstance(mlp_out, dict) and len(mlp_out) > 0:
+            try:
+                # Find the highest numbered layer (last encoder layer)
+                int_keys = sorted([int(k) for k in mlp_out.keys()])
+                if int_keys:
+                    max_idx = int_keys[-1]
+                    enc_final_dim = int(mlp_out.get(str(max_idx), mlp_out.get(max_idx, target_dim)))
+                    logging.info(f"Using encoder output dimension from config: {enc_final_dim}")
+            except (ValueError, KeyError, TypeError) as e:
+                logging.warning(f"Could not parse mlp_output_dimensions: {e}, using {target_dim}")
+    
+    logging.info(f"Cross-attention K/V will be sliced to encoder output dim: {enc_final_dim}")
+    
+    # Slice cross-attention K/V weights to match encoder output
+    for k in cross_attn_kv_keys:
+        if k in model_state:
+            ckpt_shape = state[k].shape
+            model_shape = model_state[k].shape
+            
+            if ckpt_shape[1] != model_shape[1]:  # in_features mismatch
+                logging.info(f"Slicing {k} from {ckpt_shape} to {model_shape} (cross-attn KV)")
+                # Slice in_features dimension to match encoder output
+                state[k] = state[k][:, :model_shape[1]].contiguous()
+
+    # 8) detect REAL shape mismatches (after fixing cross-attn)
+    mism = []
+    for k, v in state.items():
+        if k in model_state and tuple(v.shape) != tuple(model_state[k].shape):
+            mism.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+
+    if mism:
+        preview = "\n".join([f"  - {k}: ckpt {a} vs model {b}" for k, a, b in mism[:25]])
+        raise RuntimeError(
+            "Checkpoint incompatible with current slicing skeleton (shape mismatches).\n"
+            "You MUST regenerate the sliced model with the same rotate/slice code + slicing_conf.\n"
+            f"First mismatches:\n{preview}"
+        )
+
+    # 9) load non-strict (we removed shortcuts)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    missing_non_shortcut = [k for k in missing if not k.endswith(shortcut_suffixes)]
+    unexpected_non_shortcut = [k for k in unexpected if not k.endswith(shortcut_suffixes)]
+    if missing_non_shortcut or unexpected_non_shortcut:
+        raise RuntimeError(
+            "Unexpected missing/unexpected keys after loading.\n"
+            f"Missing (non-shortcut): {missing_non_shortcut[:50]}\n"
+            f"Unexpected (non-shortcut): {unexpected_non_shortcut[:50]}"
+        )
+
+    # 10) recreate shortcuts as identity
+    def _eye(n: int) -> torch.nn.Parameter:
+        return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
+
+    enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
+    for la in enc_layers:
+        layer = la.layer
+        layer.attn_shortcut_Q = _eye(target_dim)
+        if hasattr(layer, "mlp_shortcut_Q"):
+            layer.mlp_shortcut_Q = _eye(target_dim)
+
+    if hasattr(model_adapter, "get_decoder_layers"):
+        for la in model_adapter.get_decoder_layers():
+            layer = la.layer
+            layer.attn_shortcut_Q = _eye(target_dim)
+            if hasattr(layer, "cross_attn_shortcut_Q"):
+                layer.cross_attn_shortcut_Q = _eye(target_dim)
+            if hasattr(layer, "mlp_shortcut_Q"):
+                layer.mlp_shortcut_Q = _eye(target_dim)
+
+    model.eval()
+
+    # 11) final finite check
+    for n, p in model.named_parameters():
+        if p is not None and not torch.isfinite(p).all():
+            raise RuntimeError(f"Non-finite parameter after load: {n}")
 
     return model_adapter, tokenizer
 
@@ -239,6 +332,3 @@ def _infer_seqlen(model, tokenizer=None, default=512) -> int:
             return int(v)
 
     return int(default)
-
-
-

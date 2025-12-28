@@ -23,7 +23,7 @@ from typing import Sequence, Any
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 import inspect
 import copy
-
+from slicegpt.config import config
 
 # ============================================================
 # Helpers: call modules with only supported kwargs (HF-version-proof)
@@ -600,9 +600,13 @@ class T5ModelAdapter(ModelAdapter):
         return [self._model.shared]
 
     def get_pre_head_layernorm(self) -> Module:
-        # Decoder final layer norm exists in HF T5
+        # After layernorm_fusion, this may not be a T5LayerNorm anymore.
         ln = self._model.decoder.final_layer_norm
-        assert isinstance(ln, self.original_layer_norm_type)
+        # Return it as long as it looks like a LayerNorm/RMSNorm module.
+        if ln is None:
+            return None
+        if not hasattr(ln, "weight"):
+            return None
         return ln
 
     def get_lm_head(self) -> Linear:

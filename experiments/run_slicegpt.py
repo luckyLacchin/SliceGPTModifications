@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import shutil
+import json  # ← ADDED
 
 import torch
 import wandb
@@ -14,6 +15,156 @@ from slicegpt import data_utils, gpu_utils, hf_utils, layernorm_fusion, rotate, 
 from slicegpt.config import config
 from slicegpt.slicing_scheduler import ConstSlicingScheduler
 
+
+# ============================================================================
+# T5 VERIFICATION AND SAVING FUNCTIONS (ADDED)
+# ============================================================================
+
+def verify_t5_slicing_consistency(model_adapter, target_dim):
+    """
+    Verify that all weight dimensions are consistent for T5 seq2seq model.
+    Returns True if consistent, False otherwise.
+    """
+    model = model_adapter.model
+    
+    # Only verify if this is a T5/seq2seq model
+    if not (hasattr(model_adapter.config, "is_encoder_decoder") and 
+            model_adapter.config.is_encoder_decoder):
+        logging.info("Skipping T5 verification (not a seq2seq model)")
+        return True
+    
+    issues = []
+    
+    logging.info("\n" + "="*70)
+    logging.info("SLICING CONSISTENCY CHECK")
+    logging.info("="*70)
+    
+    # 1. Check shared embedding
+    shared_dim = model.shared.weight.shape[1]
+    logging.info(f"\n1. Shared embedding: {model.shared.weight.shape}")
+    if shared_dim != target_dim:
+        issues.append(f"Shared embedding is {shared_dim}, expected {target_dim}")
+    
+    # 2. Check lm_head
+    lm_head_in = model.lm_head.weight.shape[1]
+    logging.info(f"2. LM head: {model.lm_head.weight.shape}")
+    if lm_head_in != target_dim:
+        issues.append(f"LM head in_features is {lm_head_in}, expected {target_dim}")
+    if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
+        issues.append("LM head is NOT tied to shared embedding!")
+    
+    # 3. Get encoder final dimension
+    enc_layers = model.encoder.block
+    enc_final_mlp = enc_layers[-1].layer[-1].DenseReluDense
+    enc_final_dim = int(enc_final_mlp.wo.weight.shape[0])
+    
+    logging.info(f"\n3. Encoder final output dimension: {enc_final_dim}")
+    
+    # 4. Check decoder cross-attention K/V (CRITICAL)
+    logging.info(f"\n4. Decoder cross-attention K/V check:")
+    dec_layers = model.decoder.block
+    for i, layer in enumerate(dec_layers):
+        ca = layer.layer[1].EncDecAttention
+        ca_k_in = ca.k.weight.shape[1]
+        ca_v_in = ca.v.weight.shape[1]
+        
+        if i < 3 or i == len(dec_layers) - 1:  # Show first 3 and last
+            logging.info(f"  Layer {i}: K/V in={ca_k_in}/{ca_v_in}")
+        
+        if ca_k_in != enc_final_dim:
+            issues.append(f"Decoder layer {i} cross-attn K in_features is {ca_k_in}, "
+                         f"expected {enc_final_dim}")
+        if ca_v_in != enc_final_dim:
+            issues.append(f"Decoder layer {i} cross-attn V in_features is {ca_v_in}, "
+                         f"expected {enc_final_dim}")
+    
+    # Summary
+    logging.info("\n" + "="*70)
+    if issues:
+        logging.error("❌ ISSUES FOUND:")
+        for issue in issues:
+            logging.error(f"  • {issue}")
+        logging.error("\n⚠️  CHECKPOINT WILL NOT BE SAVED!")
+        logging.info("="*70 + "\n")
+        return False
+    else:
+        logging.info("✅ All dimensions are consistent - safe to save")
+        logging.info("="*70 + "\n")
+        return True
+
+
+def save_sliced_t5_checkpoint(model_adapter, save_dir, model_name, sparsity):
+    """
+    Save T5 checkpoint with cross-attention K/V fix and proper weight tying.
+    """
+    model = model_adapter.model
+    save_path = pathlib.Path(save_dir)
+    
+    # Only apply T5-specific fixes for seq2seq models
+    if not (hasattr(model_adapter.config, "is_encoder_decoder") and 
+            model_adapter.config.is_encoder_decoder):
+        logging.info("Not a T5 model, using standard save")
+        return False  # Signal to use standard save path
+    
+    # T5-specific saving with fixes
+    target_dim = int(model_adapter.slicing_conf.const_dimension)
+    enc_layers = model.encoder.block
+    enc_final_mlp = enc_layers[-1].layer[-1].DenseReluDense
+    enc_final_dim = int(enc_final_mlp.wo.weight.shape[0])
+    
+    logging.info(f"\nSaving T5 checkpoint:")
+    logging.info(f"  Embedding dim: {target_dim}")
+    logging.info(f"  Encoder final dim: {enc_final_dim}")
+    
+    # Fix cross-attention K/V dimensions if needed
+    dec_layers = model.decoder.block
+    fixed_count = 0
+    for i, layer in enumerate(dec_layers):
+        ca = layer.layer[1].EncDecAttention
+        ca_k_in = ca.k.weight.shape[1]
+        ca_v_in = ca.v.weight.shape[1]
+        
+        if ca_k_in != enc_final_dim or ca_v_in != enc_final_dim:
+            ca.k.weight.data = ca.k.weight.data[:, :enc_final_dim].contiguous()
+            ca.k.in_features = enc_final_dim
+            ca.v.weight.data = ca.v.weight.data[:, :enc_final_dim].contiguous()
+            ca.v.in_features = enc_final_dim
+            fixed_count += 1
+    
+    if fixed_count > 0:
+        logging.info(f"  Fixed {fixed_count} decoder layers' cross-attn K/V")
+    
+    # Ensure lm_head tied to shared
+    if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
+        model.lm_head.weight = model.shared.weight
+        logging.info(f"  Tied lm_head to shared")
+    
+    # Get state dict and remove shortcuts
+    state_dict = model.state_dict()
+    keys_to_remove = [k for k in state_dict.keys() if 'shortcut_Q' in k]
+    for k in keys_to_remove:
+        del state_dict[k]
+    logging.info(f"  Removed {len(keys_to_remove)} shortcut_Q matrices")
+    
+    # Save checkpoint
+    model_suffix = pathlib.Path(model_name).name
+    ckpt_path = save_path / f"{model_suffix}_{sparsity}.pt"
+    torch.save(state_dict, ckpt_path)
+    logging.info(f"  ✓ Checkpoint: {ckpt_path}")
+    
+    # Save config
+    cfg_path = save_path / f"{model_suffix}_{sparsity}.json"
+    with open(cfg_path, 'w') as f:
+        json.dump(model_adapter.slicing_conf.to_dict(), f, indent=2)
+    logging.info(f"  ✓ Config: {cfg_path}")
+    
+    logging.info("✅ T5 checkpoint saved successfully!\n")
+    return True  # Signal that T5 save was used
+
+
+# ============================================================================
+# ORIGINAL CODE CONTINUES
+# ============================================================================
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -250,40 +401,119 @@ def slicing_main(args: argparse.Namespace) -> None:
             final_orientation=args.final_orientation,
         )
 
+    # ========================================================================
+    # MODIFIED SAVING SECTION (REPLACED)
+    # ========================================================================
     if args.save_dir:
+        logging.info("\n" + "="*70)
+        logging.info("VERIFICATION AND SAVING")
+        logging.info("="*70)
+        
         sliced_model_dir = pathlib.Path(args.save_dir)
         sliced_model_dir.mkdir(parents=True, exist_ok=True)
 
-        sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}.pt'
-
-        # Save the sliced model
-        torch.save(model.state_dict(), sliced_model_name)
-
-        # Save the slicing config
-        config_path = sliced_model_name.with_suffix('.json')
-        config_path.write_text(model_adapter.slicing_conf.to_json_string())
-
-        # If slicing a local model, also save HF config files in sliced model dir
-        if args.model_path:
-            try:
-                # copy all config files (tokenizer, model and slicing configs)
-                for file in pathlib.Path(args.model_path).glob("*.json"):
-                    if 'safetensors' not in str(file):
+        # Verify consistency for T5 models
+        target_dim = int(model_adapter.slicing_conf.const_dimension)
+        is_consistent = verify_t5_slicing_consistency(model_adapter, target_dim)
+        
+        if not is_consistent:
+            logging.error("❌ Consistency check failed! Skipping save.")
+            logging.error("⚠️  Please regenerate the sliced model.")
+            wandb.log({"save_status": "failed_consistency_check"})
+        else:
+            # Try T5-specific save first
+            t5_saved = save_sliced_t5_checkpoint(
+                model_adapter,
+                args.save_dir,
+                args.model,
+                args.sparsity,
+            )
+            
+            # If not T5, use standard save
+            if not t5_saved:
+                sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}.pt'
+                
+                # Standard save for non-T5 models
+                state_dict = model.state_dict()
+                keys_to_remove = [k for k in state_dict.keys() if 'shortcut_Q' in k]
+                for k in keys_to_remove:
+                    del state_dict[k]
+                
+                torch.save(state_dict, sliced_model_name)
+                
+                # Save the slicing config
+                config_path = sliced_model_name.with_suffix('.json')
+                config_path.write_text(model_adapter.slicing_conf.to_json_string())
+                logging.info(f"Standard checkpoint saved to {sliced_model_name}")
+            
+            # Copy config files if slicing a local model
+            if args.model_path:
+                try:
+                    # copy all config files (tokenizer, model and slicing configs)
+                    for file in pathlib.Path(args.model_path).glob("*.json"):
+                        if 'safetensors' not in str(file):
+                            shutil.copy(str(file), sliced_model_dir)
+                    # copy all tokenizer models
+                    for file in pathlib.Path(args.model_path).glob("*token*.model"):
                         shutil.copy(str(file), sliced_model_dir)
-                # copy all tokenizer models
-                for file in pathlib.Path(args.model_path).glob("*token*.model"):
-                    shutil.copy(str(file), sliced_model_dir)
-                # copy vocab merges if any
-                for file in pathlib.Path(args.model_path).glob("merges.txt"):
-                    shutil.copy(str(file), sliced_model_dir)
-            except OSError as e:
-                logging.info(f'Failed to copy configs and tokenizer files: {e}')
+                    # copy vocab merges if any
+                    for file in pathlib.Path(args.model_path).glob("merges.txt"):
+                        shutil.copy(str(file), sliced_model_dir)
+                except OSError as e:
+                    logging.info(f'Failed to copy configs and tokenizer files: {e}')
 
-        logging.info(f"Saved sliced model to {args.save_dir}")
+            logging.info(f"Saved sliced model to {args.save_dir}")
+            wandb.log({"save_status": "success"})
+    # ========================================================================
+    # END OF MODIFIED SECTION
+    # ========================================================================
 
     reset_model_device()
-    dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
-    logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
+
+    # Handle T5 seq2seq models differently (they need decoder_input_ids)
+    if hasattr(model_adapter.config, "is_encoder_decoder") and model_adapter.config.is_encoder_decoder:
+        logging.info("Evaluating T5 seq2seq model perplexity...")
+        try:
+            model.eval()
+            total_loss = 0
+            total_tokens = 0
+            
+            with torch.no_grad():
+                for batch in test_loader:
+                    # Move batch to device
+                    batch = {k: v.to(config.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    
+                    # T5 requires labels for loss calculation
+                    if "labels" not in batch:
+                        batch["labels"] = batch["input_ids"].clone()
+                    
+                    # Forward pass
+                    outputs = model(**batch)
+                    
+                    # Accumulate loss
+                    if hasattr(outputs, "loss") and outputs.loss is not None:
+                        batch_size = batch["input_ids"].size(0)
+                        total_loss += outputs.loss.item() * batch_size
+                        total_tokens += batch_size
+            
+            # Calculate perplexity from average loss
+            if total_tokens > 0:
+                avg_loss = total_loss / total_tokens
+                dataset_ppl = torch.exp(torch.tensor(avg_loss)).item()
+                logging.info(f'After rotating and slicing (T5): {dataset_ppl:.4f}')
+            else:
+                logging.warning("No tokens processed for perplexity calculation")
+                dataset_ppl = float('inf')
+                
+        except Exception as e:
+            logging.error(f"T5 perplexity evaluation failed: {e}")
+            dataset_ppl = float('nan')
+    else:
+        # Standard decoder-only model evaluation
+        dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
+        logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
+
     wandb.log({"sliced_ppl": dataset_ppl})
 
     sliced_param_count = sum(int(p.nelement()) for p in model.parameters())

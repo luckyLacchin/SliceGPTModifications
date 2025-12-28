@@ -35,7 +35,12 @@ def slice_attention_inputs(layer_adapter: LayerAdapter, new_embedding_dimension:
         W.weight.data = W.weight.data[:, :new_embedding_dimension]
         W.in_features = new_embedding_dimension
 
-    layer_adapter.layer.attn_shortcut_Q = nn.Parameter(layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :])
+    # Only slice shortcut Q if it exists
+    if hasattr(layer_adapter.layer, "attn_shortcut_Q") and layer_adapter.layer.attn_shortcut_Q is not None:
+        layer_adapter.layer.attn_shortcut_Q = nn.Parameter(
+            layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :]
+        )
+
 
 
 def rotate_attention_output(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
@@ -103,6 +108,17 @@ def rotate_embeddings(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
 
     # Run GC and cleanup GPU memory
     cleanup_memory()
+    
+def _sanitize_Q(Q: torch.Tensor, name: str) -> torch.Tensor:
+    if not torch.isfinite(Q).all():
+        print(f"[WARN] {name} had NaN/Inf -> replacing with identity")
+        d0, d1 = Q.shape
+        out = torch.zeros((d0, d1), dtype=Q.dtype, device=Q.device)
+        k = min(d0, d1)
+        out[:k, :k] = torch.eye(k, dtype=Q.dtype, device=Q.device)
+        return out
+    return Q
+
 
 ''''
 def slice_embeddings(model_adapter: ModelAdapter, new_embedding_dimensions: dict[int, int]) -> None:
@@ -510,194 +526,120 @@ def rotate(model_adapter: ModelAdapter, dataloader: torch.utils.data.DataLoader[
     logging.info("Rotate layers done")
 
 
-def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingScheduler | None = None) -> None:
+def slice_rotated_model(model_adapter: ModelAdapter) -> None:
     """
-    Slice a rotated model based on its slicing configuration.
-
-    Supports:
-      - decoder-only models
-      - seq2seq models (e.g., T5/FLAN-T5) by slicing encoder and decoder separately
-
-    IMPORTANT:
-      For seq2seq configs, decoder layer indices may be stored either:
-        (A) separate: encoder 0..E-1, decoder 0..D-1
-        (B) offset : encoder 0..E-1, decoder E..E+D-1
-      This function auto-detects which one you have and slices accordingly.
+    Slice embeddings / encoder / decoder / layernorm / lm_head to match model_adapter.slicing_conf.
+    For T5: lm_head must be sliced to the same dim as shared and tied to it.
     """
-    model_adapter.model.eval()
+    sc = model_adapter.slicing_conf
+    if sc is None:
+        raise ValueError("model_adapter.slicing_conf is None")
 
-    # -----------------------------
-    # Helper: detect decoder indexing scheme
-    # -----------------------------
-    def _max_int_key(d: object) -> int | None:
-        if isinstance(d, dict) and d:
-            ks = [k for k in d.keys() if isinstance(k, int)]
-            return max(ks) if ks else None
-        return None
+    hidden_size = int(model_adapter.hidden_size)
 
-    def _len_if_sequence(x: object) -> int | None:
-        if isinstance(x, (list, tuple)):
-            return len(x)
-        return None
+    # ---------- helpers ----------
+    def _get(m: dict, i: int, default: int) -> int:
+        if m is None:
+            return int(default)
+        return int(m.get(str(i), default))
 
-    def _decoder_is_offset(conf, E: int, D: int) -> bool:
-        cand = getattr(conf, "attention_input_dimensions", None)
+    
+    def _last(m: dict, default: int) -> int:
+        if not isinstance(m, dict) or len(m) == 0:
+            return int(default)
 
-        m = _max_int_key(cand)
-        if m is not None:
-            return m >= E
+        # keys may be "0","1",..., or ints; may be sparse
+        items = []
+        for k, v in m.items():
+            try:
+                ki = int(k)
+            except Exception:
+                continue
+            items.append((ki, v))
 
-        L = _len_if_sequence(cand)
-        if L is not None:
-            return L >= (E + D)
+        if not items:
+            return int(default)
 
-        return False  # safest default
+        ki_max, v_max = max(items, key=lambda t: t[0])
+        return int(v_max)
 
-    # -----------------------------
-    # Seq2Seq (T5-like) path
-    # -----------------------------
-    is_seq2seq = getattr(model_adapter.config, "is_encoder_decoder", False) and hasattr(model_adapter, "get_encoder_layers")
-    if is_seq2seq:
-        enc_layers = model_adapter.get_encoder_layers()
+
+    # ---------- embedding dim (shared) ----------
+    emb_dim = int(sc.const_dimension) if sc.const_dimension is not None else None
+    if emb_dim is None:
+        raise ValueError("slicing_conf.const_dimension is None")
+
+    # 1) Slice embeddings (T5 shared)
+    slice_embeddings(model_adapter, [emb_dim] * len(list(model_adapter.get_embeddings())))
+
+    # IMPORTANT: encoder final dim can differ from emb_dim in your config
+    # (e.g. mlp_output_dimensions["11"] == 768 in your screenshot)
+    enc_final_dim = _last(getattr(sc, "mlp_output_dimensions", None), emb_dim)
+
+    # 2) Slice ENCODER stack using per-layer maps
+    enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
+    for i, la in enumerate(enc_layers):
+        d_sa_in  = _get(getattr(sc, "attention_input_dimensions", None),  i, emb_dim)
+        d_sa_out = _get(getattr(sc, "attention_output_dimensions", None), i, emb_dim)
+        d_mlp_in = _get(getattr(sc, "mlp_input_dimensions", None),        i, emb_dim)
+        d_mlp_out= _get(getattr(sc, "mlp_output_dimensions", None),       i, emb_dim)
+
+        slice_attention_inputs(la, d_sa_in)
+        slice_attention_output(la, d_sa_out)
+
+        slice_mlp_input(la, d_mlp_in)
+        slice_mlp_output(la, d_mlp_out)
+
+    # 3) Slice DECODER stack using per-layer maps (self-attn + cross-attn + mlp)
+    if hasattr(model_adapter, "get_decoder_layers"):
         dec_layers = model_adapter.get_decoder_layers()
-        E = len(enc_layers)
-        D = len(dec_layers)
+        for j, la in enumerate(dec_layers):
+            d_sa_in  = _get(getattr(sc, "attention_input_dimensions", None),  j, emb_dim)
+            d_sa_out = _get(getattr(sc, "attention_output_dimensions", None), j, emb_dim)
+            d_mlp_in = _get(getattr(sc, "mlp_input_dimensions", None),        j, emb_dim)
+            d_mlp_out= _get(getattr(sc, "mlp_output_dimensions", None),       j, emb_dim)
 
-        # Build scheduler if not provided
-        if slicing_scheduler is None:
-            if model_adapter.slicing_conf.const_dimension is not None:
-                slicing_scheduler = ConstSlicingScheduler(model_adapter.slicing_conf.const_dimension)
-                slicing_scheduler.setup(
-                    hidden_size=model_adapter.hidden_size,
-                    layers_num=E + D,
-                    parallel_blocks=model_adapter.parallel_blocks,
-                )
-            else:
-                slicing_scheduler = ConfigSlicingScheduler(model_adapter.slicing_conf)
+            # decoder self-attn
+            slice_attention_inputs(la, d_sa_in)
+            slice_attention_output(la, d_sa_out)
 
-        decoder_is_offset = _decoder_is_offset(model_adapter.slicing_conf, E=E, D=D)
+            # decoder cross-attn: Q comes from decoder space, KV comes from encoder final space
+            slice_cross_attention_inputs(la, new_q_dim=d_sa_out, new_kv_dim=enc_final_dim)
+            # cross-attn output projects back to decoder stream; use d_mlp_in (matches your rotate code style)
+            slice_cross_attention_output(la, d_mlp_in)
 
-        # Slice embeddings (shared)
-        slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+            # decoder MLP
+            slice_mlp_input(la, d_mlp_in)
+            slice_mlp_output(la, d_mlp_out)
 
-        # -----------------------------
-        # Slice encoder layers (0..E-1)
-        # -----------------------------
-        for i, layer_adapter in enumerate(enc_layers):
-            layer = layer_adapter.layer
+    # 4) Slice pre-head layernorm (decoder final LN) to match **lm_head in_features**
+    # In your setup lm_head is tied to shared, so it must be emb_dim.
+    pre_head_ln = model_adapter.get_pre_head_layernorm()
+    if pre_head_ln is not None and hasattr(pre_head_ln, "weight") and pre_head_ln.weight is not None:
+        pre_head_ln.weight.data = pre_head_ln.weight.data[:emb_dim].contiguous()
+        if getattr(pre_head_ln, "bias", None) is not None and pre_head_ln.bias is not None:
+            pre_head_ln.bias.data = pre_head_ln.bias.data[:emb_dim].contiguous()
 
-            d_attn_in  = slicing_scheduler.get_attention_input_dimension(i)
-            d_attn_out = slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)
-            d_mlp_in   = slicing_scheduler.get_mlp_input_dimension(i)
-            d_mlp_out  = slicing_scheduler.get_mlp_output_dimension(i)
+    # 5) T5 critical: slice + tie lm_head to shared
+    if hasattr(model_adapter, "get_lm_head"):
+        lm_head = model_adapter.get_lm_head()
+        W = lm_head.weight.data[:, :emb_dim].contiguous()
+        lm_head.weight = torch.nn.Parameter(W)
+        lm_head.in_features = emb_dim
 
-            # projections
-            slice_attention_inputs(layer_adapter, d_attn_in)
-            slice_attention_output(layer_adapter, d_attn_out)
+        shared = model_adapter.get_embeddings()[0]
+        lm_head.weight = shared.weight  # tie
 
-            slice_mlp_input(layer_adapter, d_mlp_in)
-            slice_mlp_output(layer_adapter, d_mlp_out)
+        # keep config consistent
+        if hasattr(model_adapter.model, "config"):
+            model_adapter.model.config.d_model = emb_dim
+        if hasattr(model_adapter.model, "tie_weights"):
+            try:
+                model_adapter.model.tie_weights()
+            except Exception:
+                pass
 
-            # shortcuts: MUST be [in_dim, out_dim]
-            if getattr(layer, "attn_shortcut_Q", None) is not None:
-                layer.attn_shortcut_Q = nn.Parameter(layer.attn_shortcut_Q[:d_attn_in, :d_attn_out])
 
-            if getattr(layer, "mlp_shortcut_Q", None) is not None:
-                layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:d_mlp_in, :d_mlp_out])
-
-        # Encoder output dim becomes KV dim for decoder cross-attn
-        enc_out_dim = slicing_scheduler.get_mlp_output_dimension(E - 1)
-
-        # -----------------------------
-        # Slice decoder layers
-        #   if offset: idx = E + j
-        #   else    : idx = j
-        # -----------------------------
-        for j, layer_adapter in enumerate(dec_layers):
-            layer = layer_adapter.layer
-            idx = (E + j) if decoder_is_offset else j
-
-            d_attn_in  = slicing_scheduler.get_attention_input_dimension(idx)
-            d_attn_out = slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
-            d_mlp_in   = slicing_scheduler.get_mlp_input_dimension(idx)
-            d_mlp_out  = slicing_scheduler.get_mlp_output_dimension(idx)
-
-            # self-attn
-            slice_attention_inputs(layer_adapter, d_attn_in)
-            slice_attention_output(layer_adapter, d_attn_out)
-
-            # cross-attn:
-            # - Q takes decoder stream (use d_attn_out)
-            # - K/V take encoder output stream (enc_out_dim)
-            slice_cross_attention_inputs(layer_adapter, new_q_dim=d_attn_out, new_kv_dim=enc_out_dim)
-            slice_cross_attention_output(layer_adapter, d_mlp_in)
-
-            # mlp
-            slice_mlp_input(layer_adapter, d_mlp_in)
-            slice_mlp_output(layer_adapter, d_mlp_out)
-
-            # shortcuts: MUST be [in_dim, out_dim]
-            if getattr(layer, "attn_shortcut_Q", None) is not None:
-                layer.attn_shortcut_Q = nn.Parameter(layer.attn_shortcut_Q[:d_attn_in, :d_attn_out])
-
-            if getattr(layer, "cross_attn_shortcut_Q", None) is not None:
-                # residual before cross-attn is in d_attn_out, output goes into d_mlp_in
-                layer.cross_attn_shortcut_Q = nn.Parameter(layer.cross_attn_shortcut_Q[:d_attn_out, :d_mlp_in])
-
-            if getattr(layer, "mlp_shortcut_Q", None) is not None:
-                layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:d_mlp_in, :d_mlp_out])
-
-        # Slice head (if requested)
-        if slicing_scheduler.do_slice_head:
-            slice_head(model_adapter, slicing_scheduler.get_head_dimension())
-
-        return
-
-    # -----------------------------
-    # Decoder-only path (unchanged)
-    # -----------------------------
-    layers = model_adapter.get_layers()
-
-    if slicing_scheduler is None:
-        if model_adapter.slicing_conf.const_dimension is not None:
-            slicing_scheduler = ConstSlicingScheduler(model_adapter.slicing_conf.const_dimension)
-            slicing_scheduler.setup(
-                hidden_size=model_adapter.hidden_size,
-                layers_num=len(layers),
-                parallel_blocks=model_adapter.parallel_blocks,
-            )
-        else:
-            slicing_scheduler = ConfigSlicingScheduler(model_adapter.slicing_conf)
-
-    slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
-
-    for i, layer_adapter in enumerate(layers):
-        layer = layer_adapter.layer
-
-        slice_attention_inputs(layer_adapter, slicing_scheduler.get_attention_input_dimension(i))
-        slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(i))
-
-        if not model_adapter.parallel_blocks:
-            layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[: slicing_scheduler.get_mlp_input_dimension(i), :])
-
-        slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(i))
-
-        if model_adapter.parallel_blocks:
-            layer.attn_shortcut_Q = nn.Parameter(
-                layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True)]
-            )
-            slice_attention_output(layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True))
-        else:
-            layer.attn_shortcut_Q = nn.Parameter(
-                layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)]
-            )
-            layer.mlp_shortcut_Q = nn.Parameter(
-                layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(i)]
-            )
-            slice_attention_output(layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False))
-
-    if slicing_scheduler.do_slice_head:
-        slice_head(model_adapter, slicing_scheduler.get_head_dimension())
 
 
 
@@ -760,11 +702,18 @@ def pca_calc(
     H = None
     d = None
 
-    # Collect rows for SVD / pca_lowrank fallback (kept on GPU for now, moved to CPU if needed)
     rows: List[torch.Tensor] = []
 
     for idx, X_batch in enumerate(X):
         Xb = X_batch.to(device=dev, dtype=torch.float64)
+
+        # -----------------------------
+        # NEW 1) sanitize activations
+        # -----------------------------
+        if not torch.isfinite(Xb).all():
+            # replace NaN/Inf with 0 so covariance doesn't become NaN
+            Xb = torch.nan_to_num(Xb, nan=0.0, posinf=0.0, neginf=0.0)
+
         d = Xb.shape[-1] if d is None else d
 
         if ignore_masks is not None:
@@ -779,55 +728,60 @@ def pca_calc(
         else:
             rows.append(Xb.reshape(-1, d))
 
+        # covariance / gram accumulation
         H_batch = torch.sum(Xb.mT @ Xb, dim=0)
+
+        # -----------------------------
+        # NEW 2) sanitize H_batch
+        # -----------------------------
+        if not torch.isfinite(H_batch).all():
+            H_batch = torch.nan_to_num(H_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
         H = H_batch if H is None else (H + H_batch)
 
     assert H is not None and d is not None
+
+    # -----------------------------
+    # NEW 3) fail fast if H is bad
+    # -----------------------------
+    if not torch.isfinite(H).all():
+        raise RuntimeError("PCA failed: H (covariance) contains NaN/Inf. Activations are exploding upstream.")
 
     # --- Regularize strongly (adaptive) ---
     diag_mean = torch.diagonal(H).mean().abs().clamp_min(1e-12)
     eye = torch.eye(d, device=dev, dtype=torch.float64)
 
-    # Try eigendecomposition on CPU (much more stable than GPU for degenerate cases)
-    H_cpu = (H + (1e-2 * diag_mean) * eye).cpu()  # start with 1e-2
+    H_cpu = (H + (1e-2 * diag_mean) * eye).cpu()
     try:
-        evals, evecs = torch.linalg.eigh(H_cpu)  # CPU LAPACK
+        evals, evecs = torch.linalg.eigh(H_cpu)
         evals = evals.to(dev)
         evecs = evecs.to(dev)
     except Exception:
-        # Retry with heavier damping
         H_cpu2 = (H + (1e-1 * diag_mean) * eye).cpu()
         try:
             evals, evecs = torch.linalg.eigh(H_cpu2)
             evals = evals.to(dev)
             evecs = evecs.to(dev)
         except Exception:
-            # Fallback 1: SVD on CPU of concatenated samples
             Xall = torch.cat([r for r in rows if r.numel() > 0], dim=0)
             Xall_cpu = Xall.cpu()
-            # center helps
             Xall_cpu = Xall_cpu - Xall_cpu.mean(dim=0, keepdim=True)
 
             try:
-                # Add tiny jitter to break exact repeats
                 Xall_cpu = Xall_cpu + 1e-6 * torch.randn_like(Xall_cpu)
                 _, S, Vh = torch.linalg.svd(Xall_cpu, full_matrices=False)
                 evals = (S ** 2).to(dev)
                 evecs = Vh.T.to(dev)
             except Exception:
-                # Fallback 2: pca_lowrank (usually succeeds when SVD/eigh struggle)
                 try:
-                    q = min(d, max(8, min(d, Xall_cpu.shape[0] // 2)))  # small rank is enough for directions
+                    q = min(d, max(8, min(d, Xall_cpu.shape[0] // 2)))
                     U, S, V = torch.pca_lowrank(Xall_cpu, q=q, center=True)
-                    # V is (d, q); extend to (d, d) with an orthonormal completion
-                    # QR completion
                     Qfull, _ = torch.linalg.qr(
                         torch.cat([V, torch.randn(d, d - V.shape[1], dtype=V.dtype)], dim=1)
                     )
                     evecs = Qfull.to(dev)
                     evals = torch.cat([S**2, torch.zeros(d - S.numel(), dtype=S.dtype)], dim=0).to(dev)
                 except Exception:
-                    # Last resort: identity
                     evals = torch.ones(d, device=dev, dtype=torch.float64)
                     evecs = torch.eye(d, device=dev, dtype=torch.float64)
 
@@ -836,7 +790,14 @@ def pca_calc(
     eig_val = evals[idx_sort]
     eigen_vec = evecs[:, idx_sort]
 
+    # -----------------------------
+    # NEW 4) final sanity check
+    # -----------------------------
+    if not torch.isfinite(eig_val).all() or not torch.isfinite(eigen_vec).all():
+        raise RuntimeError("PCA produced NaN/Inf eigenpairs. Upstream activations likely unstable (try float32 slicing).")
+
     return eig_val, eigen_vec
+
 
 
 '''
@@ -931,7 +892,7 @@ def rotate_and_slice_seq2seq(
     apply_mask: bool = True,
     final_orientation: str = "pca",
 ) -> None:
-    model_adapter.model.to(dtype=torch.float16) 
+    model_adapter.model.to(device=config.device, dtype=torch.float32)
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
 
@@ -944,7 +905,7 @@ def rotate_and_slice_seq2seq(
     for batch in dataloader:
         dec_batches.append(batch)
         inp0, args0, kwargs0 = get_encoder_layer0_inputs(model_adapter, batch)
-        enc_inps.append(inp0)
+        enc_inps.append(inp0)     # (B,T,768) initially
         enc_args.append(args0)
         enc_kwargs.append(kwargs0)
         if apply_mask:
@@ -953,260 +914,294 @@ def rotate_and_slice_seq2seq(
     enc_layers = model_adapter.get_encoder_layers()
     dec_layers = model_adapter.get_decoder_layers()
 
-    # ======================================================================
-    # Option 1 (safest): run TWO independent scheduler setups
-    #   - encoder scheduler: layers_num = #encoder layers
-    #   - decoder scheduler: layers_num = #decoder layers
-    # The only coupling between the two stacks is the *encoder output dimension*
-    # which becomes the KV input dimension for decoder cross-attention.
-    # ======================================================================
+    # -------------------------
+    # schedulers (encoder + decoder separate)
+    # -------------------------
     enc_sched: SlicingScheduler = copy.deepcopy(slicing_scheduler)
     dec_sched: SlicingScheduler = copy.deepcopy(slicing_scheduler)
     enc_sched.setup(hidden_size=model_adapter.hidden_size, layers_num=len(enc_layers), parallel_blocks=False)
     dec_sched.setup(hidden_size=model_adapter.hidden_size, layers_num=len(dec_layers), parallel_blocks=False)
 
     # -------------------------
-    # 1) Rotate/slice shared embeddings using PCA on encoder layer0 inputs
+    # 1) Rotate embeddings (768x768), THEN slice to emb_dim
     # -------------------------
-    _, Q = pca_calc(enc_inps, enc_ignore_masks)
-    #Q = Q.to(config.device, dtype=dtype)
-    Q = Q.to(device=config.device, dtype=torch.float64)
-    
-    emb_dims = enc_sched.get_embedding_dimensions()
-    if final_orientation == "random":
-        R = random_orthogonal_upper_left(Q.shape[0], emb_dims[0]).to(device=Q.device, dtype=Q.dtype)
-        Q = Q @ R
+    _, Q0 = pca_calc(enc_inps, enc_ignore_masks)   # (768,768)
+    Q0 = Q0.to(device=config.device, dtype=torch.float64)
 
+    emb_dim = int(enc_sched.get_embedding_dimensions()[0])  # e.g. 688
 
+    # rotate embeddings with FULL 768x768
+    rotate_embeddings(model_adapter, Q0)
+    # slice embeddings to emb_dim
+    slice_embeddings(model_adapter, [emb_dim])
 
-    rotate_embeddings(model_adapter, Q)
-    slice_embeddings(model_adapter, emb_dims)
-    # keep decoder scheduler embedding config consistent (shared weights)
+    # IMPORTANT: also rotate+truncate cached encoder inputs to emb_dim
+    enc_inps = [
+        (inp.to(config.device, dtype=dtype) @ Q0.to(config.device, dtype=dtype))[:, :, :emb_dim].cpu()
+        for inp in enc_inps
+    ]
+
+    # From now on we operate in emb_dim space, and the basis is already "baked in"
+    Q_enc = torch.eye(emb_dim, device=config.device, dtype=torch.float64)
+
+    # Tie lm_head to shared (T5 invariant)
+    model = model_adapter.model
+    try:
+        if hasattr(model, "shared") and hasattr(model, "lm_head"):
+            d = int(model.shared.weight.shape[1])  # should be emb_dim
+            model.lm_head.weight.data = model.lm_head.weight.data[:, :d]
+            model.lm_head.in_features = d
+            model.lm_head.weight = model.shared.weight
+    except Exception as e:
+        logging.warning(f"Could not force-tie lm_head to shared: {e}")
+
+    # keep decoder scheduler embedding config consistent
     _ = dec_sched.get_embedding_dimensions()
 
     # -------------------------
-    # 2) Encoder stack
+    # 2) Encoder stack (FIXED: enforce PCA space == cur_dim)
     # -------------------------
-    Q_enc = Q
+    cur_dim = int(model_adapter.model.shared.weight.shape[1])  # 688 after embedding slice
+    Q_enc = torch.eye(cur_dim, device=config.device, dtype=torch.float64)
+
     for idx, layer_adapter in enumerate(tqdm(enc_layers, desc="Rotating/slicing encoder", unit="layer")):
         layer = layer_adapter.layer
-        #layer.attn_shortcut_Q = nn.Parameter(Q_enc.T.clone().to(dtype=dtype))
-        layer.attn_shortcut_Q = nn.Parameter(Q_enc.T.clone().to(device="cpu", dtype=dtype))
 
-        
-        d_sa_in = enc_sched.get_attention_input_dimension(idx)
-        rotate_attention_inputs(layer_adapter, Q_enc)
+        # ---- scheduler dims (clamped)
+        d_sa_in  = min(int(enc_sched.get_attention_input_dimension(idx)), cur_dim)
+        d_sa_out = min(int(enc_sched.get_attention_output_dimension(idx, match_head_dim=False)), cur_dim)
+        d_mlp_in = min(int(enc_sched.get_mlp_input_dimension(idx)), d_sa_out)
+        d_mlp_out = min(int(enc_sched.get_mlp_output_dimension(idx)), int(model_adapter.model.shared.weight.shape[1]))
+
+        # ============================================================
+        # 2.1 Self-attn INPUT: SLICE FIRST, then ROTATE (prevents 768x768 @ 688x688)
+        # ============================================================
         slice_attention_inputs(layer_adapter, d_sa_in)
 
+        # rotate only in the actually-kept input space
+        Q_in = Q_enc[:d_sa_in, :d_sa_in].contiguous()
+        rotate_attention_inputs(layer_adapter, Q_in)
+
+        # Update hidden_states for this layer: rotate in cur_dim, then slice to d_sa_in
         for i, inp in enumerate(enc_inps):
-            
-            enc_args[i] = layer_adapter.get_updated_args(
-                torch.matmul(
-                    inp.to(config.device, dtype=dtype),
-                    Q_enc.to(config.device, dtype=dtype),
-                )[:, :, :d_sa_in].cpu(),
-                enc_args[i],
-            )
-        _force_layer_on_device_inplace(layer_adapter.layer, dtype)
-        mlp_ln_inputs, _ = get_signals(layer_adapter, enc_args, enc_kwargs)
-        _, Q_mid = pca_calc(mlp_ln_inputs, enc_ignore_masks)
-        Q_mid = Q_mid.to(config.device, dtype=torch.float64)
+            hs = (inp.to(config.device, dtype=dtype) @ Q_enc.to(config.device, dtype=dtype))[:, :, :d_sa_in].cpu()
+            enc_args[i] = layer_adapter.get_updated_args(hs, enc_args[i])
 
-        d_sa_out = enc_sched.get_attention_output_dimension(idx, match_head_dim=False)
-        if final_orientation == "random":
-            R = random_orthogonal_upper_left(Q_mid.shape[0], d_sa_out)
-            Q_mid = Q_mid @ R.to(device=Q_mid.device, dtype=Q_mid.dtype)
-
-        layer.attn_shortcut_Q = nn.Parameter(torch.matmul(layer.attn_shortcut_Q, Q_mid.to(dtype=dtype)[:, :d_sa_out]))
-        rotate_attention_output(layer_adapter, Q_mid)
+        # ============================================================
+        # 2.2 Self-attn OUTPUT: SLICE OUTPUT to d_sa_out BEFORE PCA signals
+        # This ensures the layer forward produces activations in <= cur_dim space.
+        # ============================================================
         slice_attention_output(layer_adapter, d_sa_out)
 
-        d_mlp_in = enc_sched.get_mlp_input_dimension(idx)
-        layer.mlp_shortcut_Q = nn.Parameter(Q_mid.T.clone().to(device="cpu", dtype=dtype)[:d_mlp_in, :])
-        rotate_mlp_input(layer_adapter, Q_mid)
+        # Set shortcut to map residual (cur_dim) -> d_sa_out safely
+        # (rectangular identity, finite)
+        layer.attn_shortcut_Q = nn.Parameter(
+            torch.eye(min(cur_dim, d_sa_out), dtype=dtype).to("cpu")
+            if cur_dim == d_sa_out else
+            torch.nn.functional.pad(torch.eye(min(cur_dim, d_sa_out), dtype=dtype), (0, max(0, d_sa_out - cur_dim), 0, max(0, cur_dim - d_sa_out))).to("cpu")[:cur_dim, :d_sa_out]
+        )
+        # FFN input must match current hidden dim (cur_dim)
+        slice_mlp_input(layer_adapter, cur_dim)
+
+        _force_layer_on_device_inplace(layer, dtype)
+
+        # Now these signals are in d_sa_out space (NOT 768)
+        mlp_ln_inputs, enc_outs_tmp = get_signals(layer_adapter, enc_args, enc_kwargs)
+
+        # PCA in the *current output* space (d_sa_out)
+        _, Q_mid = pca_calc(mlp_ln_inputs, enc_ignore_masks)
+        Q_mid = Q_mid.to(config.device, dtype=torch.float64)               # (d_sa_out, d_sa_out)
+
+        # Rotate attn output in-place (square, safe)
+        rotate_attention_output(layer_adapter, Q_mid)
+
+        # ============================================================
+        # 2.3 MLP INPUT: SLICE FIRST then ROTATE in d_mlp_in subspace
+        # ============================================================
         slice_mlp_input(layer_adapter, d_mlp_in)
+        Q_mlp_in = Q_mid[:d_mlp_in, :d_mlp_in].contiguous()
+        rotate_mlp_input(layer_adapter, Q_mlp_in)
 
-        cleanup_memory()
-
-        _force_layer_on_device_inplace(layer_adapter.layer, dtype)
-        _, enc_inps = get_signals(layer_adapter, enc_args, enc_kwargs)
-        _, Q_next = pca_calc(enc_inps, enc_ignore_masks)
-        Q_next = Q_next.to(config.device, dtype=torch.float64)
-
-        d_mlp_out = enc_sched.get_mlp_output_dimension(idx)
-        if final_orientation == "random":
-            R = random_orthogonal_upper_left(Q_next.shape[0], d_mlp_out)
-            Q_next = Q_next @ R.to(device=Q_next.device, dtype=Q_next.dtype)
-
-        layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q_next.to(dtype=dtype)))
-        rotate_mlp_output(layer_adapter, Q_next)
+        # ============================================================
+        # 2.4 MLP OUTPUT: slice to d_mlp_out and update cached activations
+        # ============================================================
         slice_mlp_output(layer_adapter, d_mlp_out)
-        layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, :d_mlp_out])
+
+        # Run once again to get final hidden states for next layer
+        _force_layer_on_device_inplace(layer, dtype)
+        _, enc_inps_next = get_signals(layer_adapter, enc_args, enc_kwargs)
+
+        # enc_inps_next are in d_mlp_out space now
+        enc_inps = [x[:, :, :d_mlp_out].cpu() for x in enc_inps_next]
+        for i in range(len(enc_args)):
+            enc_args[i] = layer_adapter.get_updated_args(enc_inps[i], enc_args[i])
+
+        # Next layer works in d_mlp_out
+        cur_dim = d_mlp_out
+        Q_enc = torch.eye(cur_dim, device=config.device, dtype=torch.float64)
 
         layer.to("cpu")
         cleanup_memory()
 
-        Q_enc = Q_next
-
-    # Encoder results
-    Q_enc_out = Q_enc
-    enc_outs = enc_inps  # CPU tensors (B, T, Denc)
+    # Encoder outputs
+    enc_outs = enc_inps
     enc_kv_dim = enc_outs[0].shape[-1]
 
-    # SIMPLIFIED DECODER SECTION - matches encoder pattern exactly
-    # No fancy cross-attention PCA, just straightforward rotate/slice like encoder
 
     # -------------------------
-    # 3) Decoder stack
+    # 3) Decoder stack (dimension-correct, no crashes)
     # -------------------------
+    def rect_eye(r: int, c: int, *, dtype, device="cpu"):
+        m = torch.zeros((r, c), dtype=dtype, device=device)
+        k = min(r, c)
+        m[:k, :k] = torch.eye(k, dtype=dtype, device=device)
+        return m
+
     dec_inps, dec_args, dec_kwargs, dec_ignore_masks = [], [], [], []
     for batch, enc_h in zip(dec_batches, enc_outs):
-        inp0, args0, kwargs0 = get_decoder_layer0_inputs(
-            model_adapter,
-            batch,
-            encoder_hidden_states=enc_h,
-        )
+        inp0, args0, kwargs0 = get_decoder_layer0_inputs(model_adapter, batch, encoder_hidden_states=enc_h)
         dec_inps.append(inp0)
         dec_args.append(args0)
         dec_kwargs.append(kwargs0)
         if apply_mask:
             dec_ignore_masks.append(batch.get("decoder_attention_mask", batch["attention_mask"]))
 
-    # Calculate PCA on decoder inputs (608-dim from sliced shared embeddings)
-    _, Q_dec = pca_calc(dec_inps, dec_ignore_masks)
-    Q_dec = Q_dec.to(device=config.device, dtype=torch.float64)
+    enc_kv_dim = int(enc_outs[0].shape[-1])  # final encoder stream dim (should be 688)
 
-    d_dec_in = dec_inps[0].shape[-1]  # Should be 608
-    if final_orientation == "random":
-        R = random_orthogonal_upper_left(d_dec_in, d_dec_in).to(device=Q_dec.device, dtype=Q_dec.dtype)
-        Q_dec = Q_dec @ R
-
-    # Extend to 768x768 for rotating unprocessed 768-dim decoder weights in first layer only
-    Q_dec_full = torch.eye(768, dtype=torch.float64, device=config.device)
-    Q_dec_full[:d_dec_in, :d_dec_in] = Q_dec
+    # In rotate.py, replace the decoder loop in rotate_and_slice_seq2seq
+    # Starting around line 1093
 
     for j, layer_adapter in enumerate(tqdm(dec_layers, desc="Rotating/slicing decoder", unit="layer")):
         layer = layer_adapter.layer
+        cur_d = int(dec_inps[0].shape[-1])   # current decoder stream dim entering this block
+
+        # pick target dims, clamp to reality
+        d_sa_in   = min(int(dec_sched.get_attention_input_dimension(j)), cur_d)
+        d_sa_out  = min(int(dec_sched.get_attention_output_dimension(j, match_head_dim=False)), d_sa_in)
+        d_mlp_in  = min(int(dec_sched.get_mlp_input_dimension(j)), d_sa_out)
+        d_mlp_out = min(int(dec_sched.get_mlp_output_dimension(j)), d_mlp_in, int(emb_dim))
+
+        # -------------------------
+        # Self-attn: CRITICAL FIX
+        # The issue: we need to handle Q/K/V head dimension vs embedding dimension carefully
+        # -------------------------
         
-        # ALL decoder layers start with 768-dim weights (unprocessed)
-        # Always use Q_dec_full which properly rotates from 768-dim space
-        Q_to_use_for_weights = Q_dec_full
-
-        layer.attn_shortcut_Q = nn.Parameter(Q_dec.T.clone().to(device="cpu", dtype=dtype))
-
-        # rotate and slice self-attention inputs
-        d_sa_in = dec_sched.get_attention_input_dimension(j)
-        rotate_attention_inputs(layer_adapter, Q_to_use_for_weights)
+        # Get attention components
+        sa = layer_adapter.layer.layer[0].SelfAttention
+        
+        # IMPORTANT: T5 attention uses d_model for queries/keys/values internally
+        # The input projection maps from hidden_dim -> d_model
+        # We need to slice BOTH the input dimension AND ensure internal dims match
+        
+        # 1) Slice attention INPUTS (Q/K/V weight matrices)
         slice_attention_inputs(layer_adapter, d_sa_in)
-
-        # update input signals
-        for i, inp in enumerate(dec_inps):
-            dec_args[i] = layer_adapter.get_updated_args(
-                torch.matmul(inp.to(device=config.device, dtype=dtype), Q_dec.to(device=config.device, dtype=dtype))[
-                    :, :, :d_sa_in
-                ].cpu(),
-                dec_args[i],
-            )
-
-        # get dimensions
-        d_sa_out = dec_sched.get_attention_output_dimension(j, match_head_dim=False)
-        d_mlp_in = dec_sched.get_mlp_input_dimension(j)
-        d_mlp_out = dec_sched.get_mlp_output_dimension(j)
-        d_mlp_in = min(d_mlp_in, d_sa_out)
+        rotate_attention_inputs(layer_adapter, torch.eye(d_sa_in, device=config.device, dtype=torch.float64))
         
-        # CRITICAL: Rotate weights BEFORE slicing them
-        # Self-attention output
-        rotate_attention_output(layer_adapter, Q_to_use_for_weights)
+        # 2) CRITICAL: After slicing Q/K/V inputs, the attention mechanism produces
+        #    outputs in the CURRENT d_model space (which is d_sa_in after slicing)
+        #    So the output projection must accept d_sa_in inputs
+        
+        # Get the actual d_model used by attention after slicing Q/K/V
+        actual_attn_d_model = sa.q.weight.shape[0]  # output features of Q projection
+        
+        # 3) Slice attention OUTPUT to d_sa_out rows
         slice_attention_output(layer_adapter, d_sa_out)
         
-        # Cross-attention: need special handling
-        # Q projection receives d_sa_out-dim input (from self-attn output)
-        # BUT: the weights are still 768-dim (unprocessed)
-        # We need a 768x768 rotation matrix where:
-        # - First d_sa_out rows/cols: identity (cross-attn input is already rotated via self-attn output)
-        # - Rest: identity (will be sliced away, so doesn't matter)
-        Q_cross = torch.eye(768, dtype=torch.float64, device=config.device)
+        # 4) CRITICAL FIX: Set output projection input dimension to match attention's d_model
+        W_o = layer_adapter.get_attention_output()
+        W_o.weight.data = W_o.weight.data[:, :actual_attn_d_model].contiguous()
+        W_o.in_features = actual_attn_d_model
         
-        # Rotate cross-attention (Q from decoder, K/V from encoder)
-        rotate_cross_attention_inputs(layer_adapter, Q_dec=Q_cross)
-        slice_cross_attention_inputs(layer_adapter, new_q_dim=d_sa_out, new_kv_dim=enc_kv_dim)
-        
-        rotate_cross_attention_output(layer_adapter, Q_cross)
-        slice_cross_attention_output(layer_adapter, d_mlp_in)
-        
-        # Rotate and slice MLP (also still 768-dim weights)
-        rotate_mlp_input(layer_adapter, Q_cross)
-        slice_mlp_input(layer_adapter, d_mlp_in)
-        
-        rotate_mlp_output(layer_adapter, Q_cross)
-        slice_mlp_output(layer_adapter, d_mlp_out)
-        
-        # Set temporary identity shortcuts
-        layer.attn_shortcut_Q = nn.Parameter(torch.eye(d_sa_in, d_sa_out, device="cpu", dtype=dtype))
-        layer.cross_attn_shortcut_Q = nn.Parameter(torch.eye(d_sa_out, d_mlp_in, device="cpu", dtype=dtype))
-        layer.mlp_shortcut_Q = nn.Parameter(torch.eye(d_mlp_in, d_mlp_out, device="cpu", dtype=dtype))
+        # 5) Rotate output (this is safe now that dimensions match)
+        rotate_attention_output(layer_adapter, torch.eye(d_sa_out, device=config.device, dtype=torch.float64))
 
-        # NOW run forward
+        # residual shortcut: from cur_d -> d_sa_out
+        layer.attn_shortcut_Q = nn.Parameter(rect_eye(cur_d, d_sa_out, dtype=dtype, device="cpu"))
+
+        # -------------------------
+        # Cross-attn inputs
+        # -------------------------
+        slice_cross_attention_inputs(layer_adapter, new_q_dim=d_sa_out, new_kv_dim=enc_kv_dim)
+        rotate_cross_attention_inputs(layer_adapter, torch.eye(d_sa_out, device=config.device, dtype=torch.float64))
+
+        # Cross-attn output
+        slice_cross_attention_output(layer_adapter, d_mlp_in)
+        rotate_cross_attention_output(layer_adapter, torch.eye(d_mlp_in, device=config.device, dtype=torch.float64))
+
+        # CRITICAL FIX: Cross-attention output columns must match its internal d_model
+        ca = layer_adapter.layer.layer[1].EncDecAttention
+        actual_cross_d_model = ca.q.weight.shape[0]
+        W_co = layer_adapter.get_cross_attention_output()
+        W_co.weight.data = W_co.weight.data[:, :actual_cross_d_model].contiguous()
+        W_co.in_features = actual_cross_d_model
+
+        layer.cross_attn_shortcut_Q = nn.Parameter(rect_eye(d_sa_out, d_mlp_in, dtype=dtype, device="cpu"))
+
+        # -------------------------
+        # MLP
+        # -------------------------
+        slice_mlp_input(layer_adapter, d_mlp_in)
+        rotate_mlp_input(layer_adapter, torch.eye(d_mlp_in, device=config.device, dtype=torch.float64))
+
+        slice_mlp_output(layer_adapter, d_mlp_out)
+        rotate_mlp_output(layer_adapter, torch.eye(d_mlp_out, device=config.device, dtype=torch.float64))
+
+        layer.mlp_shortcut_Q = nn.Parameter(rect_eye(d_mlp_in, d_mlp_out, dtype=dtype, device="cpu"))
+
+        # run once to update dec_inps
         _force_layer_on_device_inplace(layer, dtype)
-        mlp_ln_inputs, dec_inps = get_signals(layer_adapter, dec_args, dec_kwargs)
-        
-        # Calculate PCA at MLP LN
-        _, Q_mlp = pca_calc(mlp_ln_inputs, dec_ignore_masks)
-        Q_mlp = Q_mlp.to(config.device, dtype=torch.float64)
-        if final_orientation == "random":
-            R = random_orthogonal_upper_left(Q_mlp.shape[0], d_mlp_in)
-            Q_mlp = Q_mlp @ R.to(Q_mlp.device, dtype=Q_mlp.dtype)
-        
-        # Calculate PCA on outputs - but check dimensions first
-        output_dim = dec_inps[0].shape[-1] if len(dec_inps) > 0 else d_mlp_out
-        _, Q_next = pca_calc(dec_inps, dec_ignore_masks)
-        Q_next = Q_next.to(config.device, dtype=torch.float64)
-        
-        # Slice Q_next to match d_mlp_out if needed
-        if Q_next.shape[0] > d_mlp_out:
-            Q_next = Q_next[:d_mlp_out, :d_mlp_out]
-        
-        if final_orientation == "random":
-            actual_dim = Q_next.shape[0]
-            R = random_orthogonal_upper_left(actual_dim, min(actual_dim, d_mlp_out))
-            Q_next = Q_next @ R.to(Q_next.device, dtype=Q_next.dtype)
-        
-        # Update shortcuts with proper rotations
-        layer.attn_shortcut_Q = nn.Parameter(
-            torch.matmul(Q_dec.T.to(dtype=dtype)[:d_sa_in, :], Q_mlp.to(dtype=dtype)[:, :d_sa_out])
-        )
-        layer.cross_attn_shortcut_Q = nn.Parameter(
-            Q_mlp.T.to(dtype=dtype)[:d_sa_out, :d_mlp_in]
-        )
-        
-        # For MLP shortcut: ensure dimensions match
-        Q_mlp_part = Q_mlp.T.to(dtype=dtype)[:d_mlp_in, :]
-        Q_next_part = Q_next.to(dtype=dtype)
-        
-        # Ensure Q_next_part is at most d_mlp_out x d_mlp_out
-        if Q_next_part.shape[0] > d_mlp_out or Q_next_part.shape[1] > d_mlp_out:
-            Q_next_part = Q_next_part[:d_mlp_out, :d_mlp_out]
-        
-        # Now slice columns for multiplication
-        Q_next_part = Q_next_part[:, :d_mlp_out]
-        
-        # Inner dimensions: Q_mlp_part is (d_mlp_in, X), Q_next_part is (Y, d_mlp_out)
-        # We need X == Y
-        inner_dim = min(Q_mlp_part.shape[1], Q_next_part.shape[0])
-        Q_mlp_part = Q_mlp_part[:, :inner_dim]
-        Q_next_part = Q_next_part[:inner_dim, :]
-        
-        layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(Q_mlp_part, Q_next_part))
+        _, dec_inps = get_signals(layer_adapter, dec_args, dec_kwargs)
+
+        next_dim = int(dec_inps[0].shape[-1])
+        for i, inp in enumerate(dec_inps):
+            dec_args[i] = layer_adapter.get_updated_args(inp[:, :, :next_dim].cpu(), dec_args[i])
 
         layer.to("cpu")
         cleanup_memory()
 
-        Q_dec = Q_next
+        # record slicing config
+        dec_sched.slicing_conf.attention_input_dimensions[str(j)]  = int(d_sa_in)
+        dec_sched.slicing_conf.attention_output_dimensions[str(j)] = int(d_sa_out)
+        dec_sched.slicing_conf.mlp_input_dimensions[str(j)]        = int(d_mlp_in)
+        dec_sched.slicing_conf.mlp_output_dimensions[str(j)]       = int(d_mlp_out)
+
+
 
     # -------------------------
-    # 4) Head
+    # 4) finalize slicing_conf + sanitize Q buffers
     # -------------------------
-    rotate_head(model_adapter, Q_dec)
-    if dec_sched.do_slice_head:
-        slice_head(model_adapter, dec_sched.get_head_dimension())
-    model_adapter.slicing_conf = dec_sched.slicing_conf.clone() # update model's slicing config
+    model_adapter.slicing_conf = dec_sched.slicing_conf.clone()
+    model_adapter.slicing_conf.const_dimension = int(emb_dim)
+
+    for la in model_adapter.get_encoder_layers():
+        lyr = la.layer
+        if hasattr(lyr, "attn_shortcut_Q") and lyr.attn_shortcut_Q is not None:
+            lyr.attn_shortcut_Q = nn.Parameter(_sanitize_Q(lyr.attn_shortcut_Q.data, "enc_attn").cpu())
+        if hasattr(lyr, "mlp_shortcut_Q") and lyr.mlp_shortcut_Q is not None:
+            lyr.mlp_shortcut_Q = nn.Parameter(_sanitize_Q(lyr.mlp_shortcut_Q.data, "enc_mlp").cpu())
+
+    for la in model_adapter.get_decoder_layers():
+        lyr = la.layer
+        if getattr(lyr, "attn_shortcut_Q", None) is not None:
+            lyr.attn_shortcut_Q = nn.Parameter(_sanitize_Q(lyr.attn_shortcut_Q.data, "dec_attn").cpu())
+        if getattr(lyr, "cross_attn_shortcut_Q", None) is not None:
+            lyr.cross_attn_shortcut_Q = nn.Parameter(_sanitize_Q(lyr.cross_attn_shortcut_Q.data, "dec_cross").cpu())
+        if getattr(lyr, "mlp_shortcut_Q", None) is not None:
+            lyr.mlp_shortcut_Q = nn.Parameter(_sanitize_Q(lyr.mlp_shortcut_Q.data, "dec_mlp").cpu())
+    
+    # -------------------------
+    # CRITICAL: Force tie lm_head to shared after all slicing operations
+    # -------------------------
+    model = model_adapter.model
+    if hasattr(model, "shared") and hasattr(model, "lm_head"):
+        d = int(model.shared.weight.shape[1])
+        # Ensure lm_head has correct input dimension
+        if model.lm_head.weight.shape[1] != d:
+            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.data[:, :d].contiguous())
+            model.lm_head.in_features = d
+        # Tie the weights (this is the critical step)
+        model.lm_head.weight = model.shared.weight
+        logging.info(f"✓ Tied lm_head to shared embedding (dim={d})")
+
+
+
