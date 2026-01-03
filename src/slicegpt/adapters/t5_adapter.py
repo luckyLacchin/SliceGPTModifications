@@ -87,23 +87,40 @@ class CompressedT5Block(T5Block):
 
         def _apply_shortcut(residual, Q):
             """
-            Apply learned shortcut projection Q to residual if present.
-            Q is expected as [in_dim, out_dim] but we handle transposed too.
+            Apply learned shortcut projection Q to residual with proper dimension handling.
             """
             if Q is None:
                 return residual
+            
             Qd = Q.to(device=residual.device, dtype=residual.dtype)
-
-            # Standard: residual[..., in] @ Q[in,out] -> residual[..., out]
-            if residual.shape[-1] == Qd.shape[0]:
+            res_dim = residual.shape[-1]
+            
+            # Q should be [in_dim, out_dim] where in_dim = res_dim
+            if Qd.shape[0] == res_dim:
+                # Standard case: residual[..., in] @ Q[in, out] -> residual[..., out]
                 return residual @ Qd
-
-            # If stored transposed: Q[out,in]
-            if residual.shape[-1] == Qd.shape[1]:
+            elif Qd.shape[1] == res_dim:
+                # Transposed case: residual[..., in] @ Q^T[in, out]
                 return residual @ Qd.transpose(0, 1)
-
-            # If dims don’t match, just return unchanged (safer than crashing mid-slice)
-            return residual
+            elif Qd.shape[0] == Qd.shape[1]:
+                # Square matrix - might be identity or near-identity
+                target_dim = min(res_dim, Qd.shape[0])
+                if res_dim <= Qd.shape[0]:
+                    # residual is smaller - use top-left block of Q
+                    return residual @ Qd[:res_dim, :res_dim]
+                else:
+                    # Q is smaller - pad residual implicitly
+                    out = residual[..., :target_dim] @ Qd
+                    # Keep remaining dims unchanged
+                    if res_dim > target_dim:
+                        out = torch.cat([out, residual[..., target_dim:]], dim=-1)
+                    return out
+            else:
+                # Dimension mismatch - safest is to return unchanged
+                # This should not happen with properly sliced models
+                import warnings
+                warnings.warn(f"Shortcut Q dimension mismatch: residual {res_dim}, Q {Qd.shape}")
+                return residual
 
         def _match_last_dim(x, target_dim: int):
             """Force x last-dim to target_dim by slice/pad (safest during mid-slice)."""

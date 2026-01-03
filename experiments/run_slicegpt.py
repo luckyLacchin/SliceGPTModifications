@@ -187,7 +187,9 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         help="Path to load the model to fine-tune (sliced) and tokenizer from",
         default=None,
     )
-    parser.add_argument("--dtype", type=str, help="Data type to use.", choices=["fp32", "fp16"], default="fp16")
+    # In run_slicegpt.py, around line 250
+    parser.add_argument("--dtype", type=str, help="Data type to use.", 
+                    choices=["fp32", "fp16"], default="fp32")  # Changed from "fp16"
     parser.add_argument(
         "--cal-dataset",
         type=str,
@@ -384,6 +386,7 @@ def slicing_main(args: argparse.Namespace) -> None:
     )
 
     slicing_scheduler = ConstSlicingScheduler(new_embedding_dimension)
+    '''
     # Rotate + slice
     # For seq2seq models (e.g., FLAN-T5) we must slice encoder+decoder with cross-attention.
     if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
@@ -400,7 +403,24 @@ def slicing_main(args: argparse.Namespace) -> None:
             slicing_scheduler,
             final_orientation=args.final_orientation,
         )
-
+    This one was the old version, replaced below by slicing only the encoder, instead of slicing both encoder and decoder
+    '''
+    # Rotate + slice
+    # For seq2seq models (e.g., FLAN-T5) use encoder-only slicing (safer)
+    if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
+        rotate.rotate_and_slice_encoder_only(
+            model_adapter,
+            train_loader,
+            slicing_scheduler,
+            final_orientation=args.final_orientation,
+        )
+    else:
+        rotate.rotate_and_slice(
+            model_adapter,
+            train_loader,
+            slicing_scheduler,
+            final_orientation=args.final_orientation,
+        )
     # ========================================================================
     # MODIFIED SAVING SECTION (REPLACED)
     # ========================================================================

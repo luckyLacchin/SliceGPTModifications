@@ -74,11 +74,15 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
 
 
 def get_signals(
-    layer_adapter: LayerAdapter, layer_args: list[tuple], layer_kwargs: list[dict[str, Any]]
+    layer_adapter: LayerAdapter, 
+    layer_args: list[tuple], 
+    layer_kwargs: list[dict[str, Any]]
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     Take the input signals ("activations") for a layer, run the layer forward.
     Return the output of the layer (not layernormed) and the input to the MLP (pre-layernorm).
+    
+    For T5 decoder layers, this properly handles encoder_hidden_states for cross-attention.
     """
     mlp_ln_inputs = []
     outputs = []
@@ -92,10 +96,22 @@ def get_signals(
     second_layernorm = layer_adapter.get_second_layernorm()
     assert isinstance(second_layernorm, RMSN)
     hook = second_layernorm.register_forward_hook(hook_fn)
+    
     for i, (layer_args_batch, layer_kwargs_batch) in enumerate(zip(layer_args, layer_kwargs)):
         layer_args_batch, layer_kwargs_batch = utils.map_tensors(
             [layer_args_batch, layer_kwargs_batch], device=config.device
         )
+        
+        # CRITICAL FIX: For T5 decoder, ensure encoder_hidden_states is present
+        # If it's missing, the cross-attention will fail and produce garbage
+        if layer_adapter.has_cross_attention():
+            # Check if encoder_hidden_states is already in kwargs
+            if 'encoder_hidden_states' not in layer_kwargs_batch:
+                raise RuntimeError(
+                    "T5 decoder layer requires encoder_hidden_states in kwargs for cross-attention. "
+                    "Make sure to pass encoder outputs when calling get_signals() on decoder layers."
+                )
+        
         out = layer_adapter.layer(*layer_args_batch, **layer_kwargs_batch)
         if isinstance(out, tuple):
             out = out[layer_adapter.hidden_states_output_position]
@@ -103,7 +119,7 @@ def get_signals(
         outputs.append(out)
 
         if mlp_ln_inputs[i].ndim == 2:
-            batch_size, seqlen, _ = out.shape  # both batch_size and seqlen are can vary from batch to batch
+            batch_size, seqlen, _ = out.shape
             mlp_ln_inputs[i] = mlp_ln_inputs[i].reshape(batch_size, seqlen, -1)
 
     hook.remove()

@@ -182,13 +182,22 @@ def load_sliced_model(
     slice_rotated_model(model_adapter)
     model = model_adapter.model
 
-    # 4) enforce T5 invariant: lm_head tied to shared
+    # 4) enforce T5 invariant: lm_head tied to shared (FIXED ORDER)
     if hasattr(model, "shared") and hasattr(model, "lm_head"):
-        d = int(model.shared.weight.shape[1])
-        if model.lm_head.weight.shape[1] != d:
-            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.data[:, :d].contiguous())
-            model.lm_head.in_features = d
+        shared_dim = int(model.shared.weight.shape[1])
+        
+        # Ensure lm_head matches shared dimension
+        if model.lm_head.in_features != shared_dim:
+            logging.warning(f"lm_head in_features ({model.lm_head.in_features}) != shared dim ({shared_dim}), fixing...")
+            # Don't slice - just tie directly (checkpoint already has correct dims)
+            model.lm_head.in_features = shared_dim
+        
+        # Tie weights (must be same object reference)
         model.lm_head.weight = model.shared.weight
+        
+        # Verify they're actually tied
+        if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
+            raise RuntimeError("Failed to tie lm_head to shared embedding!")
 
     # 5) optional LoRA
     if lora_config:
@@ -278,7 +287,7 @@ def load_sliced_model(
             f"Missing (non-shortcut): {missing_non_shortcut[:50]}\n"
             f"Unexpected (non-shortcut): {unexpected_non_shortcut[:50]}"
         )
-
+    '''
     # 10) recreate shortcuts as identity
     def _eye(n: int) -> torch.nn.Parameter:
         return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
@@ -298,7 +307,41 @@ def load_sliced_model(
                 layer.cross_attn_shortcut_Q = _eye(target_dim)
             if hasattr(layer, "mlp_shortcut_Q"):
                 layer.mlp_shortcut_Q = _eye(target_dim)
+    '''
+    # 10) recreate shortcuts as identity
+    def _eye(n: int) -> torch.nn.Parameter:
+        return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
 
+    # Handle both full-model and encoder-only slicing
+    enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
+    
+    # Encoder shortcuts: use sliced dimension
+    for la in enc_layers:
+        layer = la.layer
+        layer.attn_shortcut_Q = _eye(target_dim)
+        if hasattr(layer, "mlp_shortcut_Q"):
+            layer.mlp_shortcut_Q = _eye(target_dim)
+
+    # Decoder shortcuts: detect actual dimension from weights
+    if hasattr(model_adapter, "get_decoder_layers"):
+        for la in model_adapter.get_decoder_layers():
+            layer = la.layer
+            
+            # Infer decoder dimension from actual weight shapes
+            # (For encoder-only slicing, decoder stays at orig_dim)
+            dec_sa_inputs = la.get_attention_inputs()
+            dec_dim = dec_sa_inputs[0].weight.shape[1] if dec_sa_inputs else orig_dim
+            
+            layer.attn_shortcut_Q = _eye(dec_dim)
+            
+            if hasattr(layer, "cross_attn_shortcut_Q"):
+                layer.cross_attn_shortcut_Q = _eye(dec_dim)
+            
+            if hasattr(layer, "mlp_shortcut_Q"):
+                dec_mlp_inputs = la.get_mlp_inputs()
+                dec_mlp_dim = dec_mlp_inputs[0].weight.shape[1] if dec_mlp_inputs else dec_dim
+                layer.mlp_shortcut_Q = _eye(dec_mlp_dim)
+                
     model.eval()
 
     # 11) final finite check
