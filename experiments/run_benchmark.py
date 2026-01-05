@@ -39,7 +39,7 @@ def benchmarking_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--eval-dataset",
         type=str,
         help="Dataset to evaluate on.",
-        choices=["wikitext2", "ptb", "c4", "squad"],
+        choices=["wikitext2", "ptb", "c4", "squad", "squad2"],
         default="wikitext2",
     )
     parser.add_argument(

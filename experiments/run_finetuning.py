@@ -118,7 +118,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--ppl-eval-dataset",
         type=str,
         help="Dataset to evaluate perplexity.",
-        choices=["wikitext2", "ptb", "c4", "alpaca", "squad"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "squad", "squad2"],
         default="wikitext2",
     )
     parser.add_argument(
@@ -137,7 +137,7 @@ def finetuning_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--finetune-dataset",
         type=str,
         help="Dataset to finetune on.",
-        choices=["wikitext2", "ptb", "c4", "alpaca", "squad"],
+        choices=["wikitext2", "ptb", "c4", "alpaca", "squad", "squad2"],
         default="wikitext2",
     )
     parser.add_argument(
@@ -287,13 +287,20 @@ def finetuning_main(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
+    task_type = (
+        TaskType.SEQ_2_SEQ_LM
+        if args.model.startswith("google/flan-t5")
+        else TaskType.CAUSAL_LM
+    )
+
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        task_type=TaskType.CAUSAL_LM,
+        task_type=task_type,
         target_modules=lora_target_map(args.model)[args.lora_target_option],
     )
+
 
     model = model_adapter.model
     lora_model = get_peft_model(model, lora_config)

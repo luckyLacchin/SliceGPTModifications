@@ -14,7 +14,7 @@ def get_dataset(name: str) -> datasets.DatasetDict:
     Get the dataset from the HuggingFace datasets library.
 
     Args:
-        name: The name of the HuggingFace dataset to load. Must be one of "wikitext2", "ptb", "c4" or "alpaca".
+        name: The name of the HuggingFace dataset to load. Must be one of "wikitext2", "ptb", "c4", "alpaca", "squad", "squad2".
 
     Returns:
         The dataset.
@@ -36,6 +36,10 @@ def get_dataset(name: str) -> datasets.DatasetDict:
         "alpaca": {"path": "tatsu-lab/alpaca", "cols_to_remove": ['input', 'output', 'instruction']},
         "squad": {
             "path": "rajpurkar/squad",
+            "config_name": None,
+        },
+        "squad2": {
+            "path": "rajpurkar/squad_v2",
             "config_name": None,
         }
     }
@@ -60,14 +64,14 @@ def get_dataset(name: str) -> datasets.DatasetDict:
         ds["validation"] = temp_ds["test"]
         
     #we have a problem, SliceGPT expects dataset to be of type DatasetDict, but squad has context, question, answers columns, so we have  to fix it
-    if name == "squad":
+    if name == "squad" or name == "squad2":
         def combine(batch):
             batch["text"] = batch["context"] + "\n\n" + batch["question"]
             return batch
 
         ds = ds.map(combine)
         ds = ds.remove_columns(["id", "title", "context", "question", "answers"])
-        
+
         #in Squad is missing the test set, so we are creating it from the validation set
         if "test" not in ds:
             temp = ds["validation"].train_test_split(test_size=0.5, seed=42)
