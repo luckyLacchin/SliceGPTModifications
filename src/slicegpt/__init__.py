@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+from .adapters.gemma_adapter import Gemma2ModelAdapter
 from .adapters.llama_adapter import LlamaModelAdapter
 from .adapters.opt_adapter import OPTModelAdapter
 from .adapters.phi2_adapter import Phi2ModelAdapter
