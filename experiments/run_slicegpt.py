@@ -23,6 +23,11 @@ from slicegpt.slicing_scheduler import ConstSlicingScheduler
 def verify_t5_slicing_consistency(model_adapter, target_dim):
     """
     Verify that all weight dimensions are consistent for T5 seq2seq model.
+    For ENCODER-ONLY slicing:
+    - Encoder outputs should be sliced dimension
+    - Decoder should remain at original dimension
+    - Embeddings/LM head should match decoder (original dimension)
+    - Cross-attention K/V should match encoder output dimension
     Returns True if consistent, False otherwise.
     """
     model = model_adapter.model
@@ -36,33 +41,53 @@ def verify_t5_slicing_consistency(model_adapter, target_dim):
     issues = []
     
     logging.info("\n" + "="*70)
-    logging.info("SLICING CONSISTENCY CHECK")
+    logging.info("SLICING CONSISTENCY CHECK (Encoder-Only Slicing)")
     logging.info("="*70)
     
-    # 1. Check shared embedding
-    shared_dim = model.shared.weight.shape[1]
-    logging.info(f"\n1. Shared embedding: {model.shared.weight.shape}")
-    if shared_dim != target_dim:
-        issues.append(f"Shared embedding is {shared_dim}, expected {target_dim}")
-    
-    # 2. Check lm_head
-    lm_head_in = model.lm_head.weight.shape[1]
-    logging.info(f"2. LM head: {model.lm_head.weight.shape}")
-    if lm_head_in != target_dim:
-        issues.append(f"LM head in_features is {lm_head_in}, expected {target_dim}")
-    if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
-        issues.append("LM head is NOT tied to shared embedding!")
-    
-    # 3. Get encoder final dimension
+    # Get dimensions
+    original_dim = model_adapter.hidden_size  # Should be 768 for flan-t5-base
     enc_layers = model.encoder.block
     enc_final_mlp = enc_layers[-1].layer[-1].DenseReluDense
     enc_final_dim = int(enc_final_mlp.wo.weight.shape[0])
     
-    logging.info(f"\n3. Encoder final output dimension: {enc_final_dim}")
-    
-    # 4. Check decoder cross-attention K/V (CRITICAL)
-    logging.info(f"\n4. Decoder cross-attention K/V check:")
+    # Get decoder dimension
     dec_layers = model.decoder.block
+    dec_final_mlp = dec_layers[-1].layer[-1].DenseReluDense
+    dec_final_dim = int(dec_final_mlp.wo.weight.shape[0])
+    
+    shared_dim = model.shared.weight.shape[1]
+    lm_head_in = model.lm_head.weight.shape[1]
+    
+    # Display dimensions
+    logging.info(f"\n1. Original model dimension: {original_dim}")
+    logging.info(f"2. Encoder final output dimension: {enc_final_dim}")
+    logging.info(f"3. Decoder final output dimension: {dec_final_dim}")
+    logging.info(f"4. Shared embedding dimension: {shared_dim}")
+    logging.info(f"5. LM head input dimension: {lm_head_in}")
+    
+    # For encoder-only slicing:
+    # - Encoder should be sliced (enc_final_dim < original_dim)
+    # - Decoder should remain original (dec_final_dim == original_dim)
+    # - Embeddings should match decoder (shared_dim == dec_final_dim)
+    # - LM head should match decoder (lm_head_in == dec_final_dim)
+    
+    if enc_final_dim >= original_dim:
+        issues.append(f"Encoder not sliced: {enc_final_dim} >= {original_dim}")
+    
+    if dec_final_dim != original_dim:
+        issues.append(f"Decoder was sliced: {dec_final_dim} != {original_dim} (should be unchanged)")
+    
+    if shared_dim != dec_final_dim:
+        issues.append(f"Shared embedding mismatch: {shared_dim} != {dec_final_dim} (decoder dim)")
+    
+    if lm_head_in != dec_final_dim:
+        issues.append(f"LM head mismatch: {lm_head_in} != {dec_final_dim} (decoder dim)")
+    
+    if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
+        issues.append("LM head is NOT tied to shared embedding!")
+    
+    # Check decoder cross-attention K/V matches encoder output
+    logging.info(f"\n6. Decoder cross-attention K/V check (should match encoder dim {enc_final_dim}):")
     for i, layer in enumerate(dec_layers):
         ca = layer.layer[1].EncDecAttention
         ca_k_in = ca.k.weight.shape[1]
@@ -73,10 +98,10 @@ def verify_t5_slicing_consistency(model_adapter, target_dim):
         
         if ca_k_in != enc_final_dim:
             issues.append(f"Decoder layer {i} cross-attn K in_features is {ca_k_in}, "
-                         f"expected {enc_final_dim}")
+                         f"expected {enc_final_dim} (encoder output)")
         if ca_v_in != enc_final_dim:
             issues.append(f"Decoder layer {i} cross-attn V in_features is {ca_v_in}, "
-                         f"expected {enc_final_dim}")
+                         f"expected {enc_final_dim} (encoder output)")
     
     # Summary
     logging.info("\n" + "="*70)
@@ -89,6 +114,9 @@ def verify_t5_slicing_consistency(model_adapter, target_dim):
         return False
     else:
         logging.info("✅ All dimensions are consistent - safe to save")
+        logging.info(f"  ✓ Encoder sliced: {original_dim} → {enc_final_dim}")
+        logging.info(f"  ✓ Decoder unchanged: {dec_final_dim}")
+        logging.info(f"  ✓ Cross-attention matches encoder: {enc_final_dim}")
         logging.info("="*70 + "\n")
         return True
 
@@ -424,6 +452,34 @@ def slicing_main(args: argparse.Namespace) -> None:
     # ========================================================================
     # MODIFIED SAVING SECTION (REPLACED)
     # ========================================================================
+    # ========================================================================
+    # FIX: Re-tie LM head to shared embeddings after slicing
+    # ========================================================================
+    # During slicing, PyTorch operations can break weight tying.
+    # We need to explicitly re-tie them before verification and saving.
+    
+    if hasattr(model_adapter, "model") and hasattr(model_adapter.model, "lm_head"):
+        model = model_adapter.model
+        
+        # Check if this is a T5/seq2seq model
+        if hasattr(model_adapter.config, "is_encoder_decoder") and model_adapter.config.is_encoder_decoder:
+            # Re-tie lm_head to shared embeddings
+            if hasattr(model, "shared") and hasattr(model, "lm_head"):
+                if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
+                    logging.info("\n" + "="*70)
+                    logging.info("RE-TYING LM HEAD TO SHARED EMBEDDINGS")
+                    logging.info("="*70)
+                    logging.info(f"Before: lm_head ptr={model.lm_head.weight.data_ptr()}")
+                    logging.info(f"Before: shared ptr={model.shared.weight.data_ptr()}")
+                    
+                    # Re-tie the weights
+                    model.lm_head.weight = model.shared.weight
+                    
+                    logging.info(f"After: lm_head ptr={model.lm_head.weight.data_ptr()}")
+                    logging.info(f"After: shared ptr={model.shared.weight.data_ptr()}")
+                    logging.info("✓ Weights successfully re-tied")
+                    logging.info("="*70 + "\n")
+    
     if args.save_dir:
         logging.info("\n" + "="*70)
         logging.info("VERIFICATION AND SAVING")

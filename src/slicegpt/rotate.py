@@ -1357,6 +1357,26 @@ def rotate_and_slice_encoder_only(
     
     logging.info(f"Encoder output dimension: {enc_output_dim}")
     
+    # Slice encoder's final layer norm to match sliced dimension
+    if hasattr(model_adapter.model.encoder, 'final_layer_norm'):
+        ln = model_adapter.model.encoder.final_layer_norm
+        
+        # Handle RMSNorm (uses 'scale') vs LayerNorm (uses 'weight')
+        if hasattr(ln, 'scale'):
+            # RMSNorm
+            if ln.scale.shape[0] != enc_output_dim:
+                ln.scale.data = ln.scale.data[:enc_output_dim].contiguous()
+                ln.normalized_shape = (enc_output_dim,)
+                logging.info(f"  Sliced encoder RMSNorm to {enc_output_dim}")
+        elif hasattr(ln, 'weight'):
+            # Standard LayerNorm
+            if ln.weight.shape[0] != enc_output_dim:
+                ln.weight.data = ln.weight.data[:enc_output_dim].contiguous()
+                if hasattr(ln, 'bias') and ln.bias is not None:
+                    ln.bias.data = ln.bias.data[:enc_output_dim].contiguous()
+                ln.normalized_shape = (enc_output_dim,)
+                logging.info(f"  Sliced encoder LayerNorm to {enc_output_dim}")
+    
     # -------------------------
     # 5) CRITICAL: Adjust decoder cross-attention K/V
     # Decoder stays 768-dim, but must accept 688-dim encoder outputs
@@ -1367,13 +1387,39 @@ def rotate_and_slice_encoder_only(
     logging.info(f"Adjusting decoder cross-attention for {enc_output_dim}-dim encoder outputs")
     
     for j, layer_adapter in enumerate(dec_layers):
-        # Decoder cross-attention K/V must accept encoder outputs (688 dims)
-        for W in layer_adapter.get_cross_attention_kv_inputs():
+        layer = layer_adapter.layer
+        cross_attn = layer.layer[1].EncDecAttention  # Access cross-attention directly
+        
+        # Only slice K and V (they process encoder outputs)
+        # Q should NOT be sliced (it processes decoder hidden states at 768-dim)
+        for param_name in ['k', 'v']:
+            W = getattr(cross_attn, param_name)
+            
             if W.weight.shape[1] != enc_output_dim:
-                # Slice K/V input dimension to match encoder output
-                W.weight.data = W.weight.data[:, :enc_output_dim].contiguous()
-                W.in_features = enc_output_dim
-                logging.info(f"  Layer {j}: Sliced cross-attn K/V to {enc_output_dim}")
+                # Get current parameters
+                old_weight = W.weight.data
+                old_bias = W.bias.data if W.bias is not None else None
+                old_out_features = W.out_features
+                device = old_weight.device
+                dtype = old_weight.dtype
+                
+                # Create new Linear layer with correct input dimension
+                new_linear = nn.Linear(
+                    in_features=enc_output_dim,
+                    out_features=old_out_features,
+                    bias=(old_bias is not None),
+                    device=device,
+                    dtype=dtype
+                )
+                
+                # Copy sliced weights
+                new_linear.weight.data = old_weight[:, :enc_output_dim].contiguous()
+                if old_bias is not None:
+                    new_linear.bias.data = old_bias.contiguous()
+                
+                # Replace the module
+                setattr(cross_attn, param_name, new_linear)
+                logging.info(f"  Layer {j}: Sliced cross-attn {param_name.upper()} to {enc_output_dim}")
     
     # -------------------------
     # 6) Save configuration

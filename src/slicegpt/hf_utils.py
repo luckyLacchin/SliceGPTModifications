@@ -6,6 +6,7 @@ import pathlib
 from typing import Any
 
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from .layernorm_fusion import fuse_modules, replace_layers
@@ -135,7 +136,16 @@ def load_sliced_model(
 ) -> tuple[ModelAdapter, PreTrainedTokenizerBase]:
     """
     Load a sliced model + tokenizer from `sliced_model_path`.
-    Fixed to handle T5 cross-attention K/V weights that may be stored at full dimension.
+    
+    MODIFIED: Now automatically adds projection layer for encoder-only sliced T5 models.
+    
+    For encoder-only slicing:
+    - Embeddings: original dimension (e.g., 768)
+    - Encoder: sliced dimension (e.g., 688)
+    - Decoder: original dimension (e.g., 768)
+    
+    This function detects the mismatch and adds a projection layer to bridge:
+    embeddings (768) → projection → encoder (688)
     """
     import pathlib
     import torch
@@ -179,7 +189,68 @@ def load_sliced_model(
         target_dim = int(model_adapter.slicing_conf.const_dimension)
 
     # 3) slice skeleton
-    slice_rotated_model(model_adapter)
+    # MODIFIED: Check if this is an encoder-only sliced checkpoint by examining the checkpoint
+    ckpt_path_temp = pathlib.Path(sliced_model_path) / my_ckpt_name
+    is_encoder_only_slicing = False
+    
+    if ckpt_path_temp.exists():
+        # Peek at checkpoint to detect encoder-only slicing
+        state_temp = torch.load(str(ckpt_path_temp), map_location="cpu")
+        
+        # Check decoder dimension from checkpoint
+        # If decoder weights are at original dimension (768), this is encoder-only slicing
+        decoder_check_key = "decoder.block.0.layer.0.SelfAttention.q.weight"
+        if decoder_check_key in state_temp:
+            decoder_dim = state_temp[decoder_check_key].shape[1]  # in_features
+            if decoder_dim == orig_dim:  # e.g., 768
+                is_encoder_only_slicing = True
+                logging.info(f"Detected encoder-only sliced checkpoint (decoder at {decoder_dim} dims)")
+        
+        del state_temp  # Free memory
+    
+    if is_encoder_only_slicing:
+        # For encoder-only slicing: Only slice the encoder, leave decoder and embeddings at original dimension
+        logging.info("Applying encoder-only slicing to model skeleton...")
+        
+        # Manually slice only encoder layers
+        if hasattr(model_adapter, 'get_encoder_layers'):
+            from .rotate import slice_attention_inputs, slice_attention_output, slice_mlp_input, slice_mlp_output
+            
+            for layer_adapter in model_adapter.get_encoder_layers():
+                slice_attention_inputs(layer_adapter, target_dim)
+                slice_attention_output(layer_adapter, target_dim)
+                slice_mlp_input(layer_adapter, target_dim)
+                slice_mlp_output(layer_adapter, target_dim)
+            
+            # Slice encoder final layer norm
+            if hasattr(model_adapter.model.encoder, 'final_layer_norm'):
+                ln = model_adapter.model.encoder.final_layer_norm
+                if hasattr(ln, 'weight'):
+                    ln.weight.data = ln.weight.data[:target_dim].contiguous()
+                    if hasattr(ln, 'bias') and ln.bias is not None:
+                        ln.bias.data = ln.bias.data[:target_dim].contiguous()
+                    ln.normalized_shape = (target_dim,)
+            
+            # Adjust decoder cross-attention K/V to accept encoder output
+            for layer_adapter in model_adapter.get_decoder_layers():
+                layer = layer_adapter.layer
+                cross_attn = layer.layer[1].EncDecAttention
+                
+                for param_name in ['k', 'v']:
+                    W = getattr(cross_attn, param_name)
+                    if W.weight.shape[1] != target_dim:
+                        # Slice input dimension to match encoder output
+                        W.weight.data = W.weight.data[:, :target_dim].contiguous()
+                        W.in_features = target_dim
+            
+            logging.info(f"✓ Encoder-only slicing applied: encoder {target_dim} dims, decoder {orig_dim} dims")
+        else:
+            logging.warning("Could not apply encoder-only slicing - no encoder layers found")
+            slice_rotated_model(model_adapter)
+    else:
+        # Standard full-model slicing
+        slice_rotated_model(model_adapter)
+    
     model = model_adapter.model
 
     # 4) enforce T5 invariant: lm_head tied to shared (FIXED ORDER)
@@ -287,27 +358,7 @@ def load_sliced_model(
             f"Missing (non-shortcut): {missing_non_shortcut[:50]}\n"
             f"Unexpected (non-shortcut): {unexpected_non_shortcut[:50]}"
         )
-    '''
-    # 10) recreate shortcuts as identity
-    def _eye(n: int) -> torch.nn.Parameter:
-        return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
 
-    enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
-    for la in enc_layers:
-        layer = la.layer
-        layer.attn_shortcut_Q = _eye(target_dim)
-        if hasattr(layer, "mlp_shortcut_Q"):
-            layer.mlp_shortcut_Q = _eye(target_dim)
-
-    if hasattr(model_adapter, "get_decoder_layers"):
-        for la in model_adapter.get_decoder_layers():
-            layer = la.layer
-            layer.attn_shortcut_Q = _eye(target_dim)
-            if hasattr(layer, "cross_attn_shortcut_Q"):
-                layer.cross_attn_shortcut_Q = _eye(target_dim)
-            if hasattr(layer, "mlp_shortcut_Q"):
-                layer.mlp_shortcut_Q = _eye(target_dim)
-    '''
     # 10) recreate shortcuts as identity
     def _eye(n: int) -> torch.nn.Parameter:
         return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
@@ -341,6 +392,133 @@ def load_sliced_model(
                 dec_mlp_inputs = la.get_mlp_inputs()
                 dec_mlp_dim = dec_mlp_inputs[0].weight.shape[1] if dec_mlp_inputs else dec_dim
                 layer.mlp_shortcut_Q = _eye(dec_mlp_dim)
+    
+    # ========================================================================
+    # NEW: ADD PROJECTION LAYER FOR ENCODER-ONLY SLICED T5 MODELS
+    # ========================================================================
+    
+    # Detect if this is an encoder-only sliced model (T5/seq2seq)
+    if hasattr(model, 'encoder') and hasattr(model, 'decoder') and hasattr(model, 'shared'):
+        # Get dimensions
+        embedding_dim = model.shared.weight.shape[1]
+        
+        # Get encoder input dimension from first encoder layer
+        if hasattr(model_adapter, 'get_encoder_layers'):
+            enc_layers_list = list(model_adapter.get_encoder_layers())
+            if enc_layers_list:
+                first_enc_layer = enc_layers_list[0]
+                enc_attn_inputs = first_enc_layer.get_attention_inputs()
+                if enc_attn_inputs:
+                    encoder_input_dim = enc_attn_inputs[0].weight.shape[1]  # in_features
+                    
+                    # Check if projection is needed
+                    needs_projection = (encoder_input_dim < embedding_dim)
+                    
+                    if needs_projection:
+                        logging.info("="*70)
+                        logging.info("ENCODER-ONLY SLICING DETECTED")
+                        logging.info("="*70)
+                        logging.info(f"Embedding dimension: {embedding_dim}")
+                        logging.info(f"Encoder input dimension: {encoder_input_dim}")
+                        logging.info(f"Adding projection layer: {embedding_dim} → {encoder_input_dim}")
+                        
+                        # Create projection layer (simple truncation)
+                        projection = nn.Linear(embedding_dim, encoder_input_dim, bias=False)
+                        with torch.no_grad():
+                            # Initialize with identity truncation
+                            projection.weight.data = torch.eye(encoder_input_dim, embedding_dim, dtype=torch.float32)
+                        
+                        # Store projection in model
+                        model.encoder_projection = projection
+                        
+                        # CRITICAL: T5 encoder has its own embed_tokens that references model.shared
+                        # We need to wrap it so that it applies projection automatically
+                        class ProjectedEmbedding(nn.Module):
+                            def __init__(self, original_embedding, projection):
+                                super().__init__()
+                                self.original_embedding = original_embedding
+                                self.projection = projection
+                                # Copy attributes for compatibility
+                                self.num_embeddings = original_embedding.num_embeddings
+                                self.embedding_dim = projection.out_features  # Projected dimension
+                                self.padding_idx = original_embedding.padding_idx
+                                
+                                # Cache projected weight (don't recompute every time)
+                                self._weight_cache = None
+                                self._weight_dirty = True
+                            
+                            def forward(self, input_ids):
+                                # Get full embeddings
+                                embeds = self.original_embedding(input_ids)
+                                # Apply projection
+                                return self.projection(embeds)
+                            
+                            @property
+                            def weight(self):
+                                # Return projected weight for compatibility
+                                # Cache it to avoid recomputation
+                                if self._weight_dirty or self._weight_cache is None:
+                                    with torch.no_grad():
+                                        self._weight_cache = self.projection(self.original_embedding.weight.detach())
+                                    self._weight_dirty = False
+                                return self._weight_cache
+                            
+                            def _invalidate_cache(self):
+                                self._weight_dirty = True
+                        
+                        # Replace encoder's embed_tokens with projected version
+                        if hasattr(model.encoder, 'embed_tokens'):
+                            model.encoder.embed_tokens = ProjectedEmbedding(model.shared, projection)
+                            logging.info("✓ Replaced encoder.embed_tokens with projected version")
+                        
+                        # Also wrap encoder forward method as backup (for inputs_embeds path)
+                        original_encoder_forward = model.encoder.forward
+                        
+                        def encoder_forward_with_projection(
+                            input_ids=None,
+                            attention_mask=None,
+                            inputs_embeds=None,
+                            head_mask=None,
+                            output_attentions=None,
+                            output_hidden_states=None,
+                            return_dict=None,
+                            **kwargs,  # Catch any additional kwargs
+                        ):
+                            """
+                            Modified encoder forward that applies projection to embeddings.
+                            
+                            Note: If input_ids is provided, encoder.embed_tokens (which we replaced)
+                            will handle the projection automatically. This wrapper is mainly for
+                            the inputs_embeds path.
+                            """
+                            # If inputs_embeds is provided directly, we need to project it
+                            if inputs_embeds is not None:
+                                inputs_embeds = model.encoder_projection(inputs_embeds)
+                            
+                            # Call original encoder
+                            # If input_ids is provided, encoder will use its embed_tokens (already projected)
+                            # If inputs_embeds is provided, we just projected it above
+                            return original_encoder_forward(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                inputs_embeds=inputs_embeds,
+                                head_mask=head_mask,
+                                output_attentions=output_attentions,
+                                output_hidden_states=output_hidden_states,
+                                return_dict=return_dict,
+                                **kwargs,
+                            )
+                        
+                        # Replace encoder forward method
+                        model.encoder.forward = encoder_forward_with_projection
+                        
+                        logging.info("✓ Projection layer created and encoder forward method wrapped")
+                        logging.info("✓ Model can now perform forward passes")
+                        logging.info("="*70)
+    
+    # ========================================================================
+    # END OF PROJECTION LAYER ADDITION
+    # ========================================================================
                 
     model.eval()
 
