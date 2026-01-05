@@ -20,28 +20,38 @@ from slicegpt.slicing_scheduler import ConstSlicingScheduler
 # T5 VERIFICATION AND SAVING FUNCTIONS (ADDED)
 # ============================================================================
 
-def verify_t5_slicing_consistency(model_adapter, target_dim):
+def verify_t5_slicing_consistency(model_adapter, target_dim, slicing_mode="encoder"):
     """
     Verify that all weight dimensions are consistent for T5 seq2seq model.
+
     For ENCODER-ONLY slicing:
     - Encoder outputs should be sliced dimension
     - Decoder should remain at original dimension
     - Embeddings/LM head should match decoder (original dimension)
     - Cross-attention K/V should match encoder output dimension
+
+    For BOTH (encoder+decoder) slicing:
+    - Both encoder and decoder outputs should be sliced dimension
+    - Embeddings/LM head should match sliced dimension
+    - Cross-attention K/V should match encoder output dimension
+
     Returns True if consistent, False otherwise.
     """
     model = model_adapter.model
-    
+
     # Only verify if this is a T5/seq2seq model
-    if not (hasattr(model_adapter.config, "is_encoder_decoder") and 
+    if not (hasattr(model_adapter.config, "is_encoder_decoder") and
             model_adapter.config.is_encoder_decoder):
         logging.info("Skipping T5 verification (not a seq2seq model)")
         return True
-    
+
     issues = []
-    
+
     logging.info("\n" + "="*70)
-    logging.info("SLICING CONSISTENCY CHECK (Encoder-Only Slicing)")
+    if slicing_mode == "encoder":
+        logging.info("SLICING CONSISTENCY CHECK (Encoder-Only Slicing)")
+    else:
+        logging.info("SLICING CONSISTENCY CHECK (Both Encoder+Decoder Slicing)")
     logging.info("="*70)
     
     # Get dimensions
@@ -64,25 +74,44 @@ def verify_t5_slicing_consistency(model_adapter, target_dim):
     logging.info(f"3. Decoder final output dimension: {dec_final_dim}")
     logging.info(f"4. Shared embedding dimension: {shared_dim}")
     logging.info(f"5. LM head input dimension: {lm_head_in}")
-    
-    # For encoder-only slicing:
-    # - Encoder should be sliced (enc_final_dim < original_dim)
-    # - Decoder should remain original (dec_final_dim == original_dim)
-    # - Embeddings should match decoder (shared_dim == dec_final_dim)
-    # - LM head should match decoder (lm_head_in == dec_final_dim)
-    
-    if enc_final_dim >= original_dim:
-        issues.append(f"Encoder not sliced: {enc_final_dim} >= {original_dim}")
-    
-    if dec_final_dim != original_dim:
-        issues.append(f"Decoder was sliced: {dec_final_dim} != {original_dim} (should be unchanged)")
-    
-    if shared_dim != dec_final_dim:
-        issues.append(f"Shared embedding mismatch: {shared_dim} != {dec_final_dim} (decoder dim)")
-    
-    if lm_head_in != dec_final_dim:
-        issues.append(f"LM head mismatch: {lm_head_in} != {dec_final_dim} (decoder dim)")
-    
+
+    if slicing_mode == "encoder":
+        # For encoder-only slicing:
+        # - Encoder should be sliced (enc_final_dim < original_dim)
+        # - Decoder should remain original (dec_final_dim == original_dim)
+        # - Embeddings should match decoder (shared_dim == dec_final_dim)
+        # - LM head should match decoder (lm_head_in == dec_final_dim)
+
+        if enc_final_dim >= original_dim:
+            issues.append(f"Encoder not sliced: {enc_final_dim} >= {original_dim}")
+
+        if dec_final_dim != original_dim:
+            issues.append(f"Decoder was sliced: {dec_final_dim} != {original_dim} (should be unchanged)")
+
+        if shared_dim != dec_final_dim:
+            issues.append(f"Shared embedding mismatch: {shared_dim} != {dec_final_dim} (decoder dim)")
+
+        if lm_head_in != dec_final_dim:
+            issues.append(f"LM head mismatch: {lm_head_in} != {dec_final_dim} (decoder dim)")
+
+    else:  # slicing_mode == "both"
+        # For both encoder+decoder slicing:
+        # - Both encoder and decoder should be sliced to target_dim
+        # - Embeddings should match target_dim
+        # - LM head should match target_dim
+
+        if enc_final_dim != target_dim:
+            issues.append(f"Encoder dimension mismatch: {enc_final_dim} != {target_dim}")
+
+        if dec_final_dim != target_dim:
+            issues.append(f"Decoder dimension mismatch: {dec_final_dim} != {target_dim}")
+
+        if shared_dim != target_dim:
+            issues.append(f"Shared embedding mismatch: {shared_dim} != {target_dim}")
+
+        if lm_head_in != target_dim:
+            issues.append(f"LM head mismatch: {lm_head_in} != {target_dim}")
+
     if model.lm_head.weight.data_ptr() != model.shared.weight.data_ptr():
         issues.append("LM head is NOT tied to shared embedding!")
     
@@ -254,6 +283,13 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         help="Final orientation of the sliced weights.",
     )
     parser.add_argument(
+        "--slicing-mode",
+        type=str,
+        default="encoder",
+        choices=["encoder", "both"],
+        help="For seq2seq models: slice only encoder or both encoder and decoder.",
+    )
+    parser.add_argument(
         "--ppl-eval-seqlen", type=int, default=2048, help="Sequence length for evaluating the perplexity."
     )
     parser.add_argument("--ppl-eval-batch-size", type=int, default=8, help="Batch size for evaluating the perplexity.")
@@ -414,35 +450,28 @@ def slicing_main(args: argparse.Namespace) -> None:
     )
 
     slicing_scheduler = ConstSlicingScheduler(new_embedding_dimension)
-    '''
+
     # Rotate + slice
-    # For seq2seq models (e.g., FLAN-T5) we must slice encoder+decoder with cross-attention.
+    # For seq2seq models (e.g., FLAN-T5), choose slicing mode based on --slicing-mode argument
     if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
-        rotate.rotate_and_slice_seq2seq(
-            model_adapter,
-            train_loader,
-            slicing_scheduler,
-            final_orientation=args.final_orientation,
-        )
+        if args.slicing_mode == "encoder":
+            logging.info("Slicing mode: ENCODER ONLY")
+            rotate.rotate_and_slice_encoder_only(
+                model_adapter,
+                train_loader,
+                slicing_scheduler,
+                final_orientation=args.final_orientation,
+            )
+        elif args.slicing_mode == "both":
+            logging.info("Slicing mode: BOTH ENCODER AND DECODER")
+            rotate.rotate_and_slice_seq2seq(
+                model_adapter,
+                train_loader,
+                slicing_scheduler,
+                final_orientation=args.final_orientation,
+            )
     else:
-        rotate.rotate_and_slice(
-            model_adapter,
-            train_loader,
-            slicing_scheduler,
-            final_orientation=args.final_orientation,
-        )
-    This one was the old version, replaced below by slicing only the encoder, instead of slicing both encoder and decoder
-    '''
-    # Rotate + slice
-    # For seq2seq models (e.g., FLAN-T5) use encoder-only slicing (safer)
-    if hasattr(model_adapter, "get_encoder_layers") and hasattr(model_adapter, "get_decoder_layers"):
-        rotate.rotate_and_slice_encoder_only(
-            model_adapter,
-            train_loader,
-            slicing_scheduler,
-            final_orientation=args.final_orientation,
-        )
-    else:
+        # For decoder-only models (GPT, OPT, LLaMA), use standard slicing
         rotate.rotate_and_slice(
             model_adapter,
             train_loader,
@@ -490,7 +519,7 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         # Verify consistency for T5 models
         target_dim = int(model_adapter.slicing_conf.const_dimension)
-        is_consistent = verify_t5_slicing_consistency(model_adapter, target_dim)
+        is_consistent = verify_t5_slicing_consistency(model_adapter, target_dim, args.slicing_mode)
         
         if not is_consistent:
             logging.error("❌ Consistency check failed! Skipping save.")
