@@ -540,7 +540,13 @@ def slice_rotated_model(model_adapter: ModelAdapter) -> None:
     def _get(m: dict, i: int, default: int) -> int:
         if m is None:
             return int(default)
-        return int(m.get(str(i), default))
+        # Try both string and int keys
+        if str(i) in m:
+            return int(m[str(i)])
+        elif i in m:
+            return int(m[i])
+        else:
+            return int(default)
 
     
     def _last(m: dict, default: int) -> int:
@@ -566,9 +572,16 @@ def slice_rotated_model(model_adapter: ModelAdapter) -> None:
     # ---------- embedding dim (shared) ----------
     emb_dim = int(sc.const_dimension) if sc.const_dimension is not None else None
     if emb_dim is None:
-        raise ValueError("slicing_conf.const_dimension is None")
+        # For decoder-only models (e.g., Gemma) with per-layer dimensions,
+        # embedding should match FIRST layer's input, not last layer's output
+        if hasattr(sc, 'attention_input_dimensions') and sc.attention_input_dimensions:
+            # Use first layer's dimension for embeddings
+            emb_dim = int(next(iter(sc.attention_input_dimensions.values())))
+            logging.info(f"Inferred embedding dimension from first layer input: {emb_dim}")
+        else:
+            raise ValueError("slicing_conf.const_dimension is None and cannot infer from per-layer dimensions")
 
-    # 1) Slice embeddings (T5 shared)
+    # 1) Slice embeddings to match first layer's expected input
     slice_embeddings(model_adapter, [emb_dim] * len(list(model_adapter.get_embeddings())))
 
     # IMPORTANT: encoder final dim can differ from emb_dim in your config
@@ -611,32 +624,44 @@ def slice_rotated_model(model_adapter: ModelAdapter) -> None:
             slice_mlp_input(la, d_mlp_in)
             slice_mlp_output(la, d_mlp_out)
 
-    # 4) Slice pre-head layernorm (decoder final LN) to match **lm_head in_features**
-    # In your setup lm_head is tied to shared, so it must be emb_dim.
+    # 4) Slice pre-head layernorm and lm_head
+    # For decoder-only models (Gemma): lm_head input should match final layer output
+    # For encoder-decoder models (T5): lm_head is tied to shared embeddings
+
+    # Determine lm_head dimension: use final layer's MLP output for decoder-only models
+    if hasattr(model_adapter, "get_encoder_layers"):
+        # T5-like: use emb_dim (tied to shared)
+        lm_head_dim = emb_dim
+    else:
+        # Gemma-like: use final layer's output dimension
+        lm_head_dim = enc_final_dim  # This was computed by _last() from mlp_output_dimensions
+
     pre_head_ln = model_adapter.get_pre_head_layernorm()
     if pre_head_ln is not None and hasattr(pre_head_ln, "weight") and pre_head_ln.weight is not None:
-        pre_head_ln.weight.data = pre_head_ln.weight.data[:emb_dim].contiguous()
+        pre_head_ln.weight.data = pre_head_ln.weight.data[:lm_head_dim].contiguous()
         if getattr(pre_head_ln, "bias", None) is not None and pre_head_ln.bias is not None:
-            pre_head_ln.bias.data = pre_head_ln.bias.data[:emb_dim].contiguous()
+            pre_head_ln.bias.data = pre_head_ln.bias.data[:lm_head_dim].contiguous()
 
-    # 5) T5 critical: slice + tie lm_head to shared
+    # 5) Slice lm_head
     if hasattr(model_adapter, "get_lm_head"):
         lm_head = model_adapter.get_lm_head()
-        W = lm_head.weight.data[:, :emb_dim].contiguous()
+        W = lm_head.weight.data[:, :lm_head_dim].contiguous()
         lm_head.weight = torch.nn.Parameter(W)
-        lm_head.in_features = emb_dim
+        lm_head.in_features = lm_head_dim
 
-        shared = model_adapter.get_embeddings()[0]
-        lm_head.weight = shared.weight  # tie
+        # T5: tie to shared embeddings
+        if hasattr(model_adapter, "get_encoder_layers"):
+            shared = model_adapter.get_embeddings()[0]
+            lm_head.weight = shared.weight  # tie
 
-        # keep config consistent
-        if hasattr(model_adapter.model, "config"):
-            model_adapter.model.config.d_model = emb_dim
-        if hasattr(model_adapter.model, "tie_weights"):
-            try:
-                model_adapter.model.tie_weights()
-            except Exception:
-                pass
+            # keep config consistent
+            if hasattr(model_adapter.model, "config"):
+                model_adapter.model.config.d_model = emb_dim
+            if hasattr(model_adapter.model, "tie_weights"):
+                try:
+                    model_adapter.model.tie_weights()
+                except Exception:
+                    pass
 
 
 

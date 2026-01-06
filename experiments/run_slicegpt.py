@@ -618,8 +618,15 @@ def slicing_main(args: argparse.Namespace) -> None:
             dataset_ppl = float('nan')
     else:
         # Standard decoder-only model evaluation
-        dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
-        logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
+        try:
+            dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
+            logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
+        except torch.cuda.OutOfMemoryError as e:
+            logging.warning(f"Perplexity evaluation skipped due to OOM: {e}")
+            dataset_ppl = float('nan')
+        except Exception as e:
+            logging.error(f"Perplexity evaluation failed: {e}")
+            dataset_ppl = float('nan')
 
     wandb.log({"sliced_ppl": dataset_ppl})
 

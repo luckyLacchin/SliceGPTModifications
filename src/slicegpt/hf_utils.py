@@ -184,9 +184,38 @@ def load_sliced_model(
         sc.const_dimension = target_dim
         model_adapter.slicing_conf = sc
     else:
-        if model_adapter.slicing_conf.const_dimension is None:
-            raise ValueError("slicing_conf exists but const_dimension is None.")
-        target_dim = int(model_adapter.slicing_conf.const_dimension)
+        # Handle both const_dimension (T5) and per-layer dimensions (Gemma)
+        if model_adapter.slicing_conf.const_dimension is not None:
+            target_dim = int(model_adapter.slicing_conf.const_dimension)
+        else:
+            # For models with per-layer dimensions (e.g., Gemma), use FINAL layer's output dimension
+            # This is what feeds into lm_head, so it's the critical dimension
+            if hasattr(model_adapter.slicing_conf, 'mlp_output_dimensions') and model_adapter.slicing_conf.mlp_output_dimensions:
+                # Get the last (highest numbered) layer's MLP output dimension
+                mlp_dims = model_adapter.slicing_conf.mlp_output_dimensions
+                layer_indices = sorted([int(k) for k in mlp_dims.keys()])
+                if layer_indices:
+                    last_layer_idx = layer_indices[-1]
+                    # Try both int and str keys
+                    if last_layer_idx in mlp_dims:
+                        target_dim = int(mlp_dims[last_layer_idx])
+                    elif str(last_layer_idx) in mlp_dims:
+                        target_dim = int(mlp_dims[str(last_layer_idx)])
+                    else:
+                        raise KeyError(f"Cannot find layer {last_layer_idx} in mlp_output_dimensions")
+                    logging.info(f"Inferred target dimension from final layer {last_layer_idx} MLP output: {target_dim}")
+                else:
+                    raise ValueError("mlp_output_dimensions exists but is empty")
+            elif hasattr(model_adapter.slicing_conf, 'attention_input_dimensions') and model_adapter.slicing_conf.attention_input_dimensions:
+                # Fallback: use first layer's dimension
+                first_layer_dim = next(iter(model_adapter.slicing_conf.attention_input_dimensions.values()))
+                target_dim = int(first_layer_dim)
+                logging.info(f"Inferred target dimension from first layer: {target_dim}")
+            else:
+                # Last fallback: calculate from sparsity
+                target_dim = int((1.0 - float(sparsity)) * orig_dim)
+                target_dim -= target_dim % int(round_interval or 1)
+                logging.warning(f"Could not find dimension in config, calculated from sparsity: {target_dim}")
 
     # 3) slice skeleton
     # MODIFIED: Check if this is an encoder-only sliced checkpoint by examining the checkpoint
@@ -360,18 +389,72 @@ def load_sliced_model(
         )
 
     # 10) recreate shortcuts as identity
+    # Detect model dtype from first parameter
+    model_dtype = next(model.parameters()).dtype
+    model_device = next(model.parameters()).device
+
     def _eye(n: int) -> torch.nn.Parameter:
-        return torch.nn.Parameter(torch.eye(n, dtype=torch.float32, device="cpu"))
+        return torch.nn.Parameter(torch.eye(n, dtype=model_dtype, device=model_device))
+
+    def _projection(in_dim: int, out_dim: int) -> torch.nn.Parameter:
+        """Create a projection matrix for dimension mismatch in residual connections."""
+        if in_dim == out_dim:
+            return _eye(in_dim)
+        # Create rectangular identity-like projection
+        # For expansion (in < out): pad with zeros
+        # For reduction (in > out): truncate
+        proj = torch.zeros(in_dim, out_dim, dtype=model_dtype, device=model_device)
+        min_dim = min(in_dim, out_dim)
+        proj[:min_dim, :min_dim] = torch.eye(min_dim, dtype=model_dtype, device=model_device)
+        return torch.nn.Parameter(proj)
+
+    def _get_layer_dim(layer_idx: int, default_dim: int, dim_type: str = 'attention') -> int:
+        """Get the dimension for a specific layer from slicing config.
+
+        Args:
+            layer_idx: Layer index
+            default_dim: Fallback dimension
+            dim_type: 'attention' for attention_input_dimensions, 'mlp' for mlp_output_dimensions
+        """
+        sc = model_adapter.slicing_conf
+
+        # If const_dimension exists, use it for all layers
+        if sc.const_dimension is not None:
+            return int(sc.const_dimension)
+
+        # Choose the right dimension dict based on type
+        if dim_type == 'mlp':
+            dim_dict = getattr(sc, 'mlp_output_dimensions', None)
+        else:  # 'attention'
+            dim_dict = getattr(sc, 'attention_input_dimensions', None)
+
+        # For per-layer dimensions, look up the layer
+        if dim_dict:
+            # Try both string and int keys
+            if str(layer_idx) in dim_dict:
+                return int(dim_dict[str(layer_idx)])
+            elif layer_idx in dim_dict:
+                return int(dim_dict[layer_idx])
+
+        # Fallback to default
+        return int(default_dim)
 
     # Handle both full-model and encoder-only slicing
     enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
-    
-    # Encoder shortcuts: use sliced dimension
-    for la in enc_layers:
+
+    # Encoder shortcuts: use per-layer dimensions
+    for i, la in enumerate(enc_layers):
         layer = la.layer
-        layer.attn_shortcut_Q = _eye(target_dim)
+        # Attention shortcut uses attention input dimension
+        attn_dim = _get_layer_dim(i, target_dim, dim_type='attention')
+        layer.attn_shortcut_Q = _eye(attn_dim)
+
+        # MLP shortcut: needs to handle dimension mismatch when MLP output != attention output
         if hasattr(layer, "mlp_shortcut_Q"):
-            layer.mlp_shortcut_Q = _eye(target_dim)
+            mlp_out_dim = _get_layer_dim(i, target_dim, dim_type='mlp')
+            # Residual has attention output dimension, MLP has mlp_out_dim
+            # Shortcut transforms residual (attn_dim) to match MLP output (mlp_out_dim)
+            layer.mlp_shortcut_Q = _projection(attn_dim, mlp_out_dim)
 
     # Decoder shortcuts: detect actual dimension from weights
     if hasattr(model_adapter, "get_decoder_layers"):

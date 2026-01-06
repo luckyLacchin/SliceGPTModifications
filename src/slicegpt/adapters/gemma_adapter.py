@@ -161,9 +161,16 @@ if HAS_GEMMA3:
                 **kwargs,
             )
 
+            # Handle variable return values from attention
+            # When output_attentions=False: (hidden_states, past_key_value)
+            # When output_attentions=True: (hidden_states, attn_weights, past_key_value)
             hidden_states = attn_output[0]
-            self_attn_weights = attn_output[1] if output_attentions else None
-            present_key_value = attn_output[2] if use_cache else None
+            if output_attentions:
+                self_attn_weights = attn_output[1]
+                present_key_value = attn_output[2] if use_cache else None
+            else:
+                self_attn_weights = None
+                present_key_value = attn_output[1] if use_cache else None
 
             # Apply shortcut to residual if slicing has occurred
             if hasattr(self, 'attn_shortcut_Q') and self.attn_shortcut_Q is not None:
