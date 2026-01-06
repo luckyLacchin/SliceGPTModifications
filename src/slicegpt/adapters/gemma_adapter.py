@@ -14,7 +14,7 @@ from transformers import PretrainedConfig, PreTrainedTokenizerBase, AutoConfig, 
 
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
-# Try importing Gemma classes - both Gemma 1/3 and Gemma 2 share similar architecture
+# Try importing Gemma classes - Gemma 1 and Gemma 3 share similar architecture
 try:
     from transformers.models.gemma.modeling_gemma import GemmaConfig, GemmaDecoderLayer, GemmaForCausalLM, GemmaRMSNorm
     HAS_GEMMA = True
@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_GEMMA2 = False
 
+try:
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3Config, Gemma3DecoderLayer, Gemma3ForCausalLM, Gemma3RMSNorm
+    HAS_GEMMA3 = True
+except ImportError:
+    HAS_GEMMA3 = False
+
 
 # Compressed Gemma (v1/v3) Decoder Layer
 if HAS_GEMMA:
@@ -34,6 +40,67 @@ if HAS_GEMMA:
         """
         Compressed Gemma decoder layer with shortcut_Q support.
         Works for Gemma 1 and Gemma 3 models.
+        """
+
+        def forward(
+            self,
+            hidden_states: Tensor,
+            attention_mask: Tensor | None = None,
+            position_ids: LongTensor | None = None,
+            past_key_value: tuple[Tensor] | None = None,
+            output_attentions: bool | None = False,
+            use_cache: bool | None = False,
+            cache_position: Tensor | None = None,
+            **kwargs,
+        ) -> tuple:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            if self.attn_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.attn_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+
+            if self.mlp_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.mlp_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
+
+            outputs = (hidden_states,)
+
+            if output_attentions:
+                outputs += (self_attn_weights,)
+
+            if use_cache:
+                outputs += (present_key_value,)
+
+            return outputs
+
+
+# Compressed Gemma3 Decoder Layer
+if HAS_GEMMA3:
+    class CompressedGemma3DecoderLayer(Gemma3DecoderLayer):
+        """
+        Compressed Gemma3 decoder layer with shortcut_Q support.
         """
 
         def forward(
@@ -215,6 +282,7 @@ class GemmaModelAdapter(ModelAdapter):
         self._model = model
 
         # Detect model type
+        self._is_gemma3 = "Gemma3" in type(model).__name__
         self._is_gemma2 = "Gemma2" in type(model).__name__
 
     @property
@@ -227,7 +295,9 @@ class GemmaModelAdapter(ModelAdapter):
 
     @property
     def config_type(self) -> type:
-        if self._is_gemma2 and HAS_GEMMA2:
+        if self._is_gemma3 and HAS_GEMMA3:
+            return Gemma3Config
+        elif self._is_gemma2 and HAS_GEMMA2:
             return Gemma2Config
         elif HAS_GEMMA:
             return GemmaConfig
@@ -251,7 +321,9 @@ class GemmaModelAdapter(ModelAdapter):
 
     @property
     def original_layer_type(self) -> type:
-        if self._is_gemma2 and HAS_GEMMA2:
+        if self._is_gemma3 and HAS_GEMMA3:
+            return Gemma3DecoderLayer
+        elif self._is_gemma2 and HAS_GEMMA2:
             return Gemma2DecoderLayer
         elif HAS_GEMMA:
             return GemmaDecoderLayer
@@ -260,7 +332,9 @@ class GemmaModelAdapter(ModelAdapter):
 
     @property
     def original_layer_norm_type(self) -> type:
-        if self._is_gemma2 and HAS_GEMMA2:
+        if self._is_gemma3 and HAS_GEMMA3:
+            return Gemma3RMSNorm
+        elif self._is_gemma2 and HAS_GEMMA2:
             return Gemma2RMSNorm
         elif HAS_GEMMA:
             return GemmaRMSNorm
@@ -273,7 +347,9 @@ class GemmaModelAdapter(ModelAdapter):
 
     @property
     def compressed_layer_type(self) -> type:
-        if self._is_gemma2 and HAS_GEMMA2:
+        if self._is_gemma3 and HAS_GEMMA3:
+            return CompressedGemma3DecoderLayer
+        elif self._is_gemma2 and HAS_GEMMA2:
             return CompressedGemma2DecoderLayer
         elif HAS_GEMMA:
             return CompressedGemmaDecoderLayer
@@ -360,9 +436,17 @@ class GemmaModelAdapter(ModelAdapter):
         )
 
         # Determine which model class to use
-        is_gemma2 = "Gemma2" in config.architectures[0] if hasattr(config, 'architectures') else False
+        arch_name = config.architectures[0] if hasattr(config, 'architectures') else ""
+        is_gemma3 = "Gemma3" in arch_name
+        is_gemma2 = "Gemma2" in arch_name
 
-        if is_gemma2 and HAS_GEMMA2:
+        if is_gemma3 and HAS_GEMMA3:
+            class UninitializedGemma3ForCausalLM(Gemma3ForCausalLM):
+                def _init_weights(self, _) -> None:
+                    pass
+
+            model = UninitializedGemma3ForCausalLM(config)
+        elif is_gemma2 and HAS_GEMMA2:
             class UninitializedGemma2ForCausalLM(Gemma2ForCausalLM):
                 def _init_weights(self, _) -> None:
                     pass

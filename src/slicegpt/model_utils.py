@@ -34,16 +34,28 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
         W.weight = torch.nn.Parameter(W.weight.to(config.device))
 
     class Catcher(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, original_layer):
             super().__init__()
+            self.original_layer = original_layer
 
         def forward(self, *args, **kwargs):
             self.saved_args = args
             self.saved_kwargs = kwargs
             raise ValueError
 
+        def __getattr__(self, name):
+            # Pass through attributes from original layer (e.g., attention_type for Gemma 3)
+            if name in ('original_layer', 'saved_args', 'saved_kwargs'):
+                return super().__getattr__(name)
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                if hasattr(self, 'original_layer'):
+                    return getattr(self.original_layer, name)
+                raise
+
     layer0_adapter = model_adapter.get_layers()[0]
-    layer0_catcher = Catcher()
+    layer0_catcher = Catcher(layer0_adapter.layer)
     model_adapter.set_raw_layer_at(0, layer0_catcher)
 
     try:
