@@ -139,12 +139,11 @@ def slice_embeddings(model_adapter, new_embedding_dimensions):
 
     # --- Case 2: dict-like ---
     elif isinstance(new_embedding_dimensions, dict):
-        # If it has integer keys 0..N-1, use them (original behavior)
-        if all(i in new_embedding_dimensions for i in range(len(embeddings))):
+        # Try to access keys 0..N-1 directly (works for defaultdict and regular dict)
+        try:
             dims = [new_embedding_dimensions[i] for i in range(len(embeddings))]
-        else:
-            # Fallback ONLY to avoid KeyError:
-            # infer target dim from slicing_conf (works for T5 reloads)
+        except (KeyError, TypeError):
+            # Fallback: infer target dim from slicing_conf (works for T5 reloads)
             sc = getattr(model_adapter, "slicing_conf", None)
             inferred = None
 

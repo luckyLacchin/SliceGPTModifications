@@ -517,10 +517,12 @@ def slicing_main(args: argparse.Namespace) -> None:
         sliced_model_dir = pathlib.Path(args.save_dir)
         sliced_model_dir.mkdir(parents=True, exist_ok=True)
 
-        # Verify consistency for T5 models
-        target_dim = int(model_adapter.slicing_conf.const_dimension)
-        is_consistent = verify_t5_slicing_consistency(model_adapter, target_dim, args.slicing_mode)
-        
+        # Verify consistency for T5 models only
+        is_consistent = True
+        if hasattr(model_adapter.slicing_conf, 'const_dimension') and model_adapter.slicing_conf.const_dimension is not None:
+            target_dim = int(model_adapter.slicing_conf.const_dimension)
+            is_consistent = verify_t5_slicing_consistency(model_adapter, target_dim, args.slicing_mode)
+
         if not is_consistent:
             logging.error("❌ Consistency check failed! Skipping save.")
             logging.error("⚠️  Please regenerate the sliced model.")
@@ -533,7 +535,7 @@ def slicing_main(args: argparse.Namespace) -> None:
                 args.model,
                 args.sparsity,
             )
-            
+
             # If not T5, use standard save
             if not t5_saved:
                 sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}.pt'

@@ -116,7 +116,7 @@ def get_signals(
         
         # CRITICAL FIX: For T5 decoder, ensure encoder_hidden_states is present
         # If it's missing, the cross-attention will fail and produce garbage
-        if layer_adapter.has_cross_attention():
+        if layer_adapter.has_cross_attention:
             # Check if encoder_hidden_states is already in kwargs
             if 'encoder_hidden_states' not in layer_kwargs_batch:
                 raise RuntimeError(
