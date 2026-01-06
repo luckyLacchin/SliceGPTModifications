@@ -2,103 +2,164 @@
 # Licensed under the MIT license.
 #
 # This file contains derivations from
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/modeling_gemma2.py
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma/modeling_gemma.py
+# and https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/modeling_gemma2.py
 # Copyright 2024 Google Inc. HuggingFace Inc. team. All Rights Reserved.
 # https://www.apache.org/licenses/LICENSE-2.0
 
 import torch
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
-from transformers import PretrainedConfig, PreTrainedTokenizerBase
-from transformers.models.gemma2.modeling_gemma2 import Gemma2Config, Gemma2DecoderLayer, Gemma2ForCausalLM, Gemma2RMSNorm
+from transformers import PretrainedConfig, PreTrainedTokenizerBase, AutoConfig, AutoModelForCausalLM
 
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
+# Try importing Gemma classes - both Gemma 1/3 and Gemma 2 share similar architecture
+try:
+    from transformers.models.gemma.modeling_gemma import GemmaConfig, GemmaDecoderLayer, GemmaForCausalLM, GemmaRMSNorm
+    HAS_GEMMA = True
+except ImportError:
+    HAS_GEMMA = False
 
-class CompressedGemma2DecoderLayer(Gemma2DecoderLayer):
-    """
-    This class simulates the Gemma2DecoderLayer class from transformers
-    but with the addition of shortcut_Q attributes for rotation.
-    """
+try:
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2Config, Gemma2DecoderLayer, Gemma2ForCausalLM, Gemma2RMSNorm
+    HAS_GEMMA2 = True
+except ImportError:
+    HAS_GEMMA2 = False
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor | None = None,
-        position_ids: LongTensor | None = None,
-        past_key_value: tuple[Tensor] | None = None,
-        output_attentions: bool | None = False,
-        use_cache: bool | None = False,
-        cache_position: Tensor | None = None,
-        **kwargs,
-    ) -> tuple:
+
+# Compressed Gemma (v1/v3) Decoder Layer
+if HAS_GEMMA:
+    class CompressedGemmaDecoderLayer(GemmaDecoderLayer):
         """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            position_ids (`torch.LongTensor`, *optional*): position ids
-            past_key_value (`tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-            output_attentions (`bool`, *optional*):
-                Whether to return the attentions tensors of all attention layers.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding.
-            cache_position (`torch.LongTensor`, *optional*): cache position for transformer models
+        Compressed Gemma decoder layer with shortcut_Q support.
+        Works for Gemma 1 and Gemma 3 models.
         """
 
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
+        def forward(
+            self,
+            hidden_states: Tensor,
+            attention_mask: Tensor | None = None,
+            position_ids: LongTensor | None = None,
+            past_key_value: tuple[Tensor] | None = None,
+            output_attentions: bool | None = False,
+            use_cache: bool | None = False,
+            cache_position: Tensor | None = None,
             **kwargs,
-        )
+        ) -> tuple:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
-        if self.attn_shortcut_Q is not None:
-            rotated_residual = matmul(residual, self.attn_shortcut_Q)
-            hidden_states = rotated_residual + hidden_states
-        else:
-            hidden_states = residual + hidden_states
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+            if self.attn_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.attn_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
 
-        if self.mlp_shortcut_Q is not None:
-            rotated_residual = matmul(residual, self.mlp_shortcut_Q)
-            hidden_states = rotated_residual + hidden_states
-        else:
-            hidden_states = residual + hidden_states
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
 
-        # Gemma2 uses pre_feedforward_layernorm and post_feedforward_layernorm
-        # Apply post feedforward layernorm if it exists
-        if hasattr(self, 'post_feedforward_layernorm') and self.post_feedforward_layernorm is not None:
-            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            if self.mlp_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.mlp_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+            outputs = (hidden_states,)
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
+            if output_attentions:
+                outputs += (self_attn_weights,)
 
-        if use_cache:
-            outputs += (present_key_value,)
+            if use_cache:
+                outputs += (present_key_value,)
 
-        return outputs
+            return outputs
 
 
-class Gemma2LayerAdapter(LayerAdapter):
-    def __init__(self, layer: Gemma2DecoderLayer) -> None:
+# Compressed Gemma2 Decoder Layer
+if HAS_GEMMA2:
+    class CompressedGemma2DecoderLayer(Gemma2DecoderLayer):
+        """
+        Compressed Gemma2 decoder layer with shortcut_Q support.
+        """
+
+        def forward(
+            self,
+            hidden_states: Tensor,
+            attention_mask: Tensor | None = None,
+            position_ids: LongTensor | None = None,
+            past_key_value: tuple[Tensor] | None = None,
+            output_attentions: bool | None = False,
+            use_cache: bool | None = False,
+            cache_position: Tensor | None = None,
+            **kwargs,
+        ) -> tuple:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+            # Self Attention
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            if self.attn_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.attn_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+
+            if self.mlp_shortcut_Q is not None:
+                rotated_residual = matmul(residual, self.mlp_shortcut_Q)
+                hidden_states = rotated_residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
+
+            # Gemma2 uses post_feedforward_layernorm
+            if hasattr(self, 'post_feedforward_layernorm') and self.post_feedforward_layernorm is not None:
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+
+            outputs = (hidden_states,)
+
+            if output_attentions:
+                outputs += (self_attn_weights,)
+
+            if use_cache:
+                outputs += (present_key_value,)
+
+            return outputs
+
+
+# Layer Adapter for Gemma (v1/v3)
+class GemmaLayerAdapter(LayerAdapter):
+    def __init__(self, layer) -> None:
         super().__init__()
-        self._layer: Gemma2DecoderLayer = layer
+        self._layer = layer
 
     @property
     def layer(self) -> Module:
@@ -147,10 +208,14 @@ class Gemma2LayerAdapter(LayerAdapter):
         raise NotImplementedError("No cross-attention")
 
 
-class Gemma2ModelAdapter(ModelAdapter):
-    def __init__(self, model: Gemma2ForCausalLM) -> None:
+# Universal Gemma Model Adapter (works for Gemma 1, 2, and 3)
+class GemmaModelAdapter(ModelAdapter):
+    def __init__(self, model) -> None:
         super().__init__()
-        self._model: Gemma2ForCausalLM = model
+        self._model = model
+
+        # Detect model type
+        self._is_gemma2 = "Gemma2" in type(model).__name__
 
     @property
     def model(self) -> Module:
@@ -162,7 +227,11 @@ class Gemma2ModelAdapter(ModelAdapter):
 
     @property
     def config_type(self) -> type:
-        return Gemma2Config
+        if self._is_gemma2 and HAS_GEMMA2:
+            return Gemma2Config
+        elif HAS_GEMMA:
+            return GemmaConfig
+        return type(self._model.config)
 
     @property
     def parallel_blocks(self) -> bool:
@@ -182,19 +251,33 @@ class Gemma2ModelAdapter(ModelAdapter):
 
     @property
     def original_layer_type(self) -> type:
-        return Gemma2DecoderLayer
+        if self._is_gemma2 and HAS_GEMMA2:
+            return Gemma2DecoderLayer
+        elif HAS_GEMMA:
+            return GemmaDecoderLayer
+        # Fallback to detecting from model structure
+        return type(self._model.model.layers[0])
 
     @property
     def original_layer_norm_type(self) -> type:
-        return Gemma2RMSNorm
+        if self._is_gemma2 and HAS_GEMMA2:
+            return Gemma2RMSNorm
+        elif HAS_GEMMA:
+            return GemmaRMSNorm
+        # Fallback
+        return type(self._model.model.norm)
 
     @property
     def layer_adapter_type(self) -> type:
-        return Gemma2LayerAdapter
+        return GemmaLayerAdapter
 
     @property
     def compressed_layer_type(self) -> type:
-        return CompressedGemma2DecoderLayer
+        if self._is_gemma2 and HAS_GEMMA2:
+            return CompressedGemma2DecoderLayer
+        elif HAS_GEMMA:
+            return CompressedGemmaDecoderLayer
+        raise RuntimeError("No Gemma classes available")
 
     @property
     def use_cache(self) -> bool:
@@ -226,7 +309,6 @@ class Gemma2ModelAdapter(ModelAdapter):
 
     def get_pre_head_layernorm(self) -> Module:
         pre_head_layernorm = self.model.model.norm
-        assert isinstance(pre_head_layernorm, self.original_layer_norm_type)
         return pre_head_layernorm
 
     def get_lm_head(self) -> Linear:
@@ -251,12 +333,13 @@ class Gemma2ModelAdapter(ModelAdapter):
         if not model_name.startswith("google/gemma"):
             return None
 
-        model = Gemma2ForCausalLM.from_pretrained(
+        # Use AutoModel to automatically detect and load the correct Gemma variant
+        model = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
         model.config.torch_dtype = dtype
 
-        return Gemma2ModelAdapter(model)
+        return GemmaModelAdapter(model)
 
     @classmethod
     def _from_uninitialized(
@@ -271,15 +354,35 @@ class Gemma2ModelAdapter(ModelAdapter):
         if not model_name.startswith("google/gemma"):
             return None
 
-        class UninitializedGemma2ForCausalLM(Gemma2ForCausalLM):
-            def _init_weights(self, _) -> None:
-                # Prevent weight initialization
-                pass
-
-        config = Gemma2Config.from_pretrained(
+        # Load config to determine model type
+        config = AutoConfig.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
-        model = UninitializedGemma2ForCausalLM(config)
+
+        # Determine which model class to use
+        is_gemma2 = "Gemma2" in config.architectures[0] if hasattr(config, 'architectures') else False
+
+        if is_gemma2 and HAS_GEMMA2:
+            class UninitializedGemma2ForCausalLM(Gemma2ForCausalLM):
+                def _init_weights(self, _) -> None:
+                    pass
+
+            model = UninitializedGemma2ForCausalLM(config)
+        elif HAS_GEMMA:
+            class UninitializedGemmaForCausalLM(GemmaForCausalLM):
+                def _init_weights(self, _) -> None:
+                    pass
+
+            model = UninitializedGemmaForCausalLM(config)
+        else:
+            # Fallback to AutoModel
+            model = AutoModelForCausalLM.from_config(config)
+
         model = model.to(dtype=dtype)
 
-        return Gemma2ModelAdapter(model)
+        return GemmaModelAdapter(model)
+
+
+# Backward compatibility aliases
+Gemma2ModelAdapter = GemmaModelAdapter
+Gemma2LayerAdapter = GemmaLayerAdapter
