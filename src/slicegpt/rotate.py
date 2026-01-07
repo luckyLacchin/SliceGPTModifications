@@ -298,12 +298,13 @@ def rotate_and_slice_sequential(
             R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0]).to(device=Q.device, dtype=Q.dtype)
             Q = Q @ R
 
-        layer.attn_shortcut_Q = nn.Parameter(
-            torch.matmul(
-                layer.attn_shortcut_Q,
-                Q.to(dtype=dtype)[:, : slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)],
-            )
+        # CRITICAL FIX: Compute attention shortcut in float64 to avoid numerical errors
+        # Keep in float64 until final assignment to preserve orthogonality
+        attn_shortcut_full = torch.matmul(
+            layer.attn_shortcut_Q.to(dtype=torch.float64),
+            Q[:, : slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)]
         )
+        layer.attn_shortcut_Q = nn.Parameter(attn_shortcut_full.to(dtype=dtype))
         rotate_attention_output(layer_adapter, Q)
         slice_attention_output(
             layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
