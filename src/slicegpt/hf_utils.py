@@ -279,8 +279,55 @@ def load_sliced_model(
     else:
         # Standard full-model slicing
         slice_rotated_model(model_adapter)
-    
+
     model = model_adapter.model
+
+    # 3.5) Create placeholder shortcuts in skeleton so checkpoint can load them
+    # Register them as parameters so PyTorch recognizes them during load_state_dict()
+    # Peek at checkpoint to get correct shapes
+    ckpt_path_temp = pathlib.Path(sliced_model_path) / my_ckpt_name
+    if ckpt_path_temp.exists():
+        import torch
+        state_temp = torch.load(str(ckpt_path_temp), map_location="cpu")
+
+        layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
+        for i, layer_adapter in enumerate(layers):
+            layer = layer_adapter.layer
+
+            # Create placeholder parameters with correct shape
+            attn_key = f"model.layers.{i}.attn_shortcut_Q"
+            mlp_key = f"model.layers.{i}.mlp_shortcut_Q"
+
+            if attn_key in state_temp:
+                shape = state_temp[attn_key].shape
+                layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+
+            if mlp_key in state_temp:
+                shape = state_temp[mlp_key].shape
+                layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+
+        # Also for decoder layers if they exist
+        if hasattr(model_adapter, "get_decoder_layers"):
+            for i, layer_adapter in enumerate(model_adapter.get_decoder_layers()):
+                layer = layer_adapter.layer
+
+                attn_key = f"decoder.block.{i}.layer.0.attn_shortcut_Q"
+                mlp_key = f"decoder.block.{i}.layer.0.mlp_shortcut_Q"
+                cross_key = f"decoder.block.{i}.layer.1.cross_attn_shortcut_Q"
+
+                if attn_key in state_temp:
+                    shape = state_temp[attn_key].shape
+                    layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+
+                if mlp_key in state_temp:
+                    shape = state_temp[mlp_key].shape
+                    layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+
+                if cross_key in state_temp:
+                    shape = state_temp[cross_key].shape
+                    layer.cross_attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+
+        del state_temp
 
     # 4) enforce T5 invariant: lm_head tied to shared (FIXED ORDER)
     if hasattr(model, "shared") and hasattr(model, "lm_head"):
@@ -313,10 +360,8 @@ def load_sliced_model(
     logging.info(f"Loading sliced model weights from {sliced_model_path}")
     state = torch.load(str(ckpt_path), map_location="cpu")
 
-    # drop shortcut_Q keys
+    # NOTE: We now KEEP shortcuts in checkpoint - they contain learned rotation matrices
     shortcut_suffixes = ("attn_shortcut_Q", "mlp_shortcut_Q", "cross_attn_shortcut_Q")
-    for k in [k for k in list(state.keys()) if k.endswith(shortcut_suffixes)]:
-        state.pop(k, None)
 
     # 7) FIX: Handle cross-attention K/V weights specially for T5
     # These may be stored at full encoder dimension (768) but model expects sliced encoder output dim
@@ -376,105 +421,27 @@ def load_sliced_model(
             f"First mismatches:\n{preview}"
         )
 
-    # 9) load non-strict (we removed shortcuts)
+    # 9) Load state dict with shortcuts included
+    # Shortcuts now contain the learned rotation matrices from slicing
     missing, unexpected = model.load_state_dict(state, strict=False)
 
-    missing_non_shortcut = [k for k in missing if not k.endswith(shortcut_suffixes)]
-    unexpected_non_shortcut = [k for k in unexpected if not k.endswith(shortcut_suffixes)]
-    if missing_non_shortcut or unexpected_non_shortcut:
-        raise RuntimeError(
-            "Unexpected missing/unexpected keys after loading.\n"
-            f"Missing (non-shortcut): {missing_non_shortcut[:50]}\n"
-            f"Unexpected (non-shortcut): {unexpected_non_shortcut[:50]}"
-        )
+    # Check for unexpected missing/unexpected keys
+    if missing or unexpected:
+        logging.warning(f"Missing keys: {missing[:10]}")
+        logging.warning(f"Unexpected keys: {unexpected[:10]}")
 
-    # 10) recreate shortcuts as identity
-    # Detect model dtype from first parameter
-    model_dtype = next(model.parameters()).dtype
-    model_device = next(model.parameters()).device
+        # Only error if non-shortcut keys are problematic
+        missing_non_shortcut = [k for k in missing if not k.endswith(shortcut_suffixes)]
+        unexpected_non_shortcut = [k for k in unexpected if not k.endswith(shortcut_suffixes)]
 
-    def _eye(n: int) -> torch.nn.Parameter:
-        return torch.nn.Parameter(torch.eye(n, dtype=model_dtype, device=model_device))
+        if missing_non_shortcut or unexpected_non_shortcut:
+            raise RuntimeError(
+                "Unexpected missing/unexpected keys after loading.\n"
+                f"Missing (non-shortcut): {missing_non_shortcut[:50]}\n"
+                f"Unexpected (non-shortcut): {unexpected_non_shortcut[:50]}"
+            )
 
-    def _projection(in_dim: int, out_dim: int) -> torch.nn.Parameter:
-        """Create a projection matrix for dimension mismatch in residual connections."""
-        if in_dim == out_dim:
-            return _eye(in_dim)
-        # Create rectangular identity-like projection
-        # For expansion (in < out): pad with zeros
-        # For reduction (in > out): truncate
-        proj = torch.zeros(in_dim, out_dim, dtype=model_dtype, device=model_device)
-        min_dim = min(in_dim, out_dim)
-        proj[:min_dim, :min_dim] = torch.eye(min_dim, dtype=model_dtype, device=model_device)
-        return torch.nn.Parameter(proj)
-
-    def _get_layer_dim(layer_idx: int, default_dim: int, dim_type: str = 'attention') -> int:
-        """Get the dimension for a specific layer from slicing config.
-
-        Args:
-            layer_idx: Layer index
-            default_dim: Fallback dimension
-            dim_type: 'attention' for attention_input_dimensions, 'mlp' for mlp_output_dimensions
-        """
-        sc = model_adapter.slicing_conf
-
-        # If const_dimension exists, use it for all layers
-        if sc.const_dimension is not None:
-            return int(sc.const_dimension)
-
-        # Choose the right dimension dict based on type
-        if dim_type == 'mlp':
-            dim_dict = getattr(sc, 'mlp_output_dimensions', None)
-        else:  # 'attention'
-            dim_dict = getattr(sc, 'attention_input_dimensions', None)
-
-        # For per-layer dimensions, look up the layer
-        if dim_dict:
-            # Try both string and int keys
-            if str(layer_idx) in dim_dict:
-                return int(dim_dict[str(layer_idx)])
-            elif layer_idx in dim_dict:
-                return int(dim_dict[layer_idx])
-
-        # Fallback to default
-        return int(default_dim)
-
-    # Handle both full-model and encoder-only slicing
-    enc_layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
-
-    # Encoder shortcuts: use per-layer dimensions
-    for i, la in enumerate(enc_layers):
-        layer = la.layer
-        # Attention shortcut uses attention input dimension
-        attn_dim = _get_layer_dim(i, target_dim, dim_type='attention')
-        layer.attn_shortcut_Q = _eye(attn_dim)
-
-        # MLP shortcut: needs to handle dimension mismatch when MLP output != attention output
-        if hasattr(layer, "mlp_shortcut_Q"):
-            mlp_out_dim = _get_layer_dim(i, target_dim, dim_type='mlp')
-            # Residual has attention output dimension, MLP has mlp_out_dim
-            # Shortcut transforms residual (attn_dim) to match MLP output (mlp_out_dim)
-            layer.mlp_shortcut_Q = _projection(attn_dim, mlp_out_dim)
-
-    # Decoder shortcuts: detect actual dimension from weights
-    if hasattr(model_adapter, "get_decoder_layers"):
-        for la in model_adapter.get_decoder_layers():
-            layer = la.layer
-            
-            # Infer decoder dimension from actual weight shapes
-            # (For encoder-only slicing, decoder stays at orig_dim)
-            dec_sa_inputs = la.get_attention_inputs()
-            dec_dim = dec_sa_inputs[0].weight.shape[1] if dec_sa_inputs else orig_dim
-            
-            layer.attn_shortcut_Q = _eye(dec_dim)
-            
-            if hasattr(layer, "cross_attn_shortcut_Q"):
-                layer.cross_attn_shortcut_Q = _eye(dec_dim)
-            
-            if hasattr(layer, "mlp_shortcut_Q"):
-                dec_mlp_inputs = la.get_mlp_inputs()
-                dec_mlp_dim = dec_mlp_inputs[0].weight.shape[1] if dec_mlp_inputs else dec_dim
-                layer.mlp_shortcut_Q = _eye(dec_mlp_dim)
+    logging.info("✓ Loaded sliced model with learned rotation shortcuts")
     
     # ========================================================================
     # NEW: ADD PROJECTION LAYER FOR ENCODER-ONLY SLICED T5 MODELS

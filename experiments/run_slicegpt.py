@@ -539,13 +539,12 @@ def slicing_main(args: argparse.Namespace) -> None:
             # If not T5, use standard save
             if not t5_saved:
                 sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}.pt'
-                
+
                 # Standard save for non-T5 models
                 state_dict = model.state_dict()
-                keys_to_remove = [k for k in state_dict.keys() if 'shortcut_Q' in k]
-                for k in keys_to_remove:
-                    del state_dict[k]
-                
+                # NOTE: We KEEP shortcuts in the checkpoint - they contain learned rotation matrices!
+                # Removing them would require recreating as identity, which breaks the model.
+
                 torch.save(state_dict, sliced_model_name)
                 
                 # Save the slicing config

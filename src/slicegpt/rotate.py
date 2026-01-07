@@ -309,8 +309,11 @@ def rotate_and_slice_sequential(
             layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
         )
 
+        # Store Q1 (MLP input rotation) in float64 for accurate computation
+        Q1 = Q.clone()
+
         layer.mlp_shortcut_Q = nn.Parameter(
-            Q.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
+            Q1.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
         )
         rotate_mlp_input(layer_adapter, Q)
         slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(idx))
@@ -321,18 +324,28 @@ def rotate_and_slice_sequential(
         # now compute the outputs of the current layer/inputs for the next layer
         # with slicing between Attention and mlp.
         _, inps = get_signals(layer_adapter, args, kwargs)
-        eig_val, Q = pca_calc(inps, ignore_masks)
+        eig_val, Q2 = pca_calc(inps, ignore_masks)
+        Q2 = Q2.to(device=config.device, dtype=torch.float64)
         if final_orientation == 'random':
-            
-            R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0]).to(device=Q.device, dtype=Q.dtype)
-            Q = Q @ R
+            R = random_orthogonal_upper_left(Q2.shape[0], slicing_scheduler.get_embedding_dimensions()[0]).to(device=Q2.device, dtype=Q2.dtype)
+            Q2 = Q2 @ R
 
-        layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q.to(dtype=dtype)))
+        # CRITICAL FIX: Compute MLP shortcut in float64 to avoid numerical errors
+        # The double matrix multiplication (Q1.T @ Q2) can accumulate errors in float16
+        mlp_shortcut_full = torch.matmul(
+            Q1.T[: slicing_scheduler.get_mlp_input_dimension(idx), :],
+            Q2
+        )
+        layer.mlp_shortcut_Q = nn.Parameter(
+            mlp_shortcut_full[:, : slicing_scheduler.get_mlp_output_dimension(idx)].to(dtype=dtype)
+        )
 
         # optionally slice the mlp/head connection in the last layer
-        rotate_mlp_output(layer_adapter, Q)
+        rotate_mlp_output(layer_adapter, Q2)
         slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
-        layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(idx)])
+
+        # Use Q2 for next layer
+        Q = Q2
 
         layer.to('cpu')
 
