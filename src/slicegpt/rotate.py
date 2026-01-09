@@ -217,6 +217,7 @@ def rotate_and_slice(
         return
 
     if model_adapter.parallel_blocks:
+        logging.info("Using parallel rotate and slice")
         rotate_and_slice_parallel(
             model_adapter,
             dataloader,
@@ -225,6 +226,7 @@ def rotate_and_slice(
             final_orientation=final_orientation,
         )
     else:
+        logging.info("Using sequential rotate and slice")
         rotate_and_slice_sequential(
             model_adapter,
             dataloader,
@@ -248,6 +250,7 @@ def rotate_and_slice_sequential(
 
     This method works for models where the MLP block is computed after the attention block.
     """
+    logging.info("Rotate and slice sequential")
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
 
@@ -376,6 +379,7 @@ def rotate_and_slice_parallel(
 
     This version works for models where the MLP block and the attention block are computed in parallel.
     """
+    logging.info("Rotate and slice parallel blocks")
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
 

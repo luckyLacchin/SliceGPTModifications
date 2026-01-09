@@ -30,6 +30,7 @@ class CompressedOPTDecoderLayer(OPTDecoderLayer):
         past_key_value: tuple[Tensor] | None = None,
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
+        **kwargs,  # Accept position_ids, cache_position, and other kwargs from newer transformers versions
     ) -> tuple:
         """
         Args:
@@ -54,13 +55,40 @@ class CompressedOPTDecoderLayer(OPTDecoderLayer):
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        # Note: newer transformers versions may pass additional kwargs and change return values
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             past_key_value=past_key_value,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
         )
+
+        # Handle different return formats from different transformers versions
+        # Newer versions return: (attn_output, attn_weights_reshaped, past_key_value)
+        # But when output_attentions=False and use_cache=False, may return just (attn_output, None)
+        hidden_states = attn_outputs[0]
+
+        if len(attn_outputs) >= 3:
+            # Standard format: (hidden_states, attention_weights, present_key_value)
+            self_attn_weights = attn_outputs[1]
+            present_key_value = attn_outputs[2]
+        elif len(attn_outputs) == 2:
+            # Simplified format when some outputs are disabled
+            # The second value could be attention weights or past_key_value depending on flags
+            if output_attentions:
+                self_attn_weights = attn_outputs[1]
+                present_key_value = None
+            elif use_cache:
+                self_attn_weights = None
+                present_key_value = attn_outputs[1]
+            else:
+                self_attn_weights = None
+                present_key_value = None
+        else:
+            # Only hidden states returned
+            self_attn_weights = None
+            present_key_value = None
 
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
         if self.attn_shortcut_Q is not None:

@@ -472,6 +472,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             )
     else:
         # For decoder-only models (GPT, OPT, LLaMA), use standard slicing
+        logging.info("Slicing mode: DECODER ONLY")
         rotate.rotate_and_slice(
             model_adapter,
             train_loader,
@@ -635,7 +636,15 @@ def slicing_main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    # Force logging reconfiguration for subprocess/Colab compatibility
+    # Clear any existing handlers and force new configuration
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Now configure logging
     utils.configure_logging(log_to_console=True, log_to_file=False, level=logging.INFO)
+
     os.environ["WANDB__SERVICE_WAIT"] = "300"
 
     slicing_args = slicing_arg_parser()

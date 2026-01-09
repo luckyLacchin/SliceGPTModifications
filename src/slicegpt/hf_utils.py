@@ -290,21 +290,31 @@ def load_sliced_model(
         import torch
         state_temp = torch.load(str(ckpt_path_temp), map_location="cpu")
 
+        # Get model dtype for creating parameters
+        model_dtype = getattr(model_adapter.config, 'torch_dtype', torch.float32)
+
         layers = model_adapter.get_encoder_layers() if hasattr(model_adapter, "get_encoder_layers") else model_adapter.get_layers()
         for i, layer_adapter in enumerate(layers):
             layer = layer_adapter.layer
 
-            # Create placeholder parameters with correct shape
-            attn_key = f"model.layers.{i}.attn_shortcut_Q"
-            mlp_key = f"model.layers.{i}.mlp_shortcut_Q"
+            # Try different key patterns for different model architectures
+            # Standard: model.layers.{i} (LLaMA, etc.)
+            # OPT: model.decoder.layers.{i}
+            key_patterns = [
+                (f"model.layers.{i}.attn_shortcut_Q", f"model.layers.{i}.mlp_shortcut_Q"),
+                (f"model.decoder.layers.{i}.attn_shortcut_Q", f"model.decoder.layers.{i}.mlp_shortcut_Q"),
+            ]
 
-            if attn_key in state_temp:
-                shape = state_temp[attn_key].shape
-                layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+            for attn_key, mlp_key in key_patterns:
+                if attn_key in state_temp:
+                    shape = state_temp[attn_key].shape
+                    # Create parameter with correct dtype to match model
+                    layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape, dtype=model_dtype))
 
-            if mlp_key in state_temp:
-                shape = state_temp[mlp_key].shape
-                layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+                if mlp_key in state_temp:
+                    shape = state_temp[mlp_key].shape
+                    # Create parameter with correct dtype to match model
+                    layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape, dtype=model_dtype))
 
         # Also for decoder layers if they exist
         if hasattr(model_adapter, "get_decoder_layers"):
@@ -317,15 +327,15 @@ def load_sliced_model(
 
                 if attn_key in state_temp:
                     shape = state_temp[attn_key].shape
-                    layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+                    layer.attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape, dtype=model_dtype))
 
                 if mlp_key in state_temp:
                     shape = state_temp[mlp_key].shape
-                    layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+                    layer.mlp_shortcut_Q = torch.nn.Parameter(torch.zeros(shape, dtype=model_dtype))
 
                 if cross_key in state_temp:
                     shape = state_temp[cross_key].shape
-                    layer.cross_attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape))
+                    layer.cross_attn_shortcut_Q = torch.nn.Parameter(torch.zeros(shape, dtype=model_dtype))
 
         del state_temp
 
@@ -362,6 +372,12 @@ def load_sliced_model(
 
     # NOTE: We now KEEP shortcuts in checkpoint - they contain learned rotation matrices
     shortcut_suffixes = ("attn_shortcut_Q", "mlp_shortcut_Q", "cross_attn_shortcut_Q")
+
+    # Convert shortcut parameters to match model dtype
+    model_dtype = getattr(model_adapter.config, 'torch_dtype', torch.float32)
+    for k in list(state.keys()):
+        if any(k.endswith(suffix) for suffix in shortcut_suffixes):
+            state[k] = state[k].to(dtype=model_dtype)
 
     # 7) FIX: Handle cross-attention K/V weights specially for T5
     # These may be stored at full encoder dimension (768) but model expects sliced encoder output dim
