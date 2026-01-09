@@ -109,5 +109,74 @@ def lora_target_map(model: str):
                     'lm_head',
                 ],
             }
+        case 'google/gemma-3-270m':
+            return {
+                'qkv_proj': ['k_proj', 'q_proj', 'v_proj'],
+                'attn_head': ['k_proj', 'q_proj', 'v_proj', 'o_proj'],
+                'attn_head_and_mlp': [
+                    'k_proj',
+                    'q_proj',
+                    'v_proj',
+                    'o_proj',
+                    'gate_proj',
+                    'up_proj',
+                    'down_proj',
+                ],
+                'attn_head_and_mlp_with_Q': [
+                    'k_proj',
+                    'q_proj',
+                    'v_proj',
+                    'o_proj',
+                    'attn_shortcut_Q',
+                    'gate_proj',
+                    'up_proj',
+                    'down_proj',
+                    'mlp_shortcut_Q',
+                ],
+                'attn_head_mlp_lm_head_with_Q': [
+                    'k_proj',
+                    'q_proj',
+                    'v_proj',
+                    'o_proj',
+                    'attn_shortcut_Q',
+                    'gate_proj',
+                    'up_proj',
+                    'down_proj',
+                    'mlp_shortcut_Q',
+                    'lm_head',
+                ],
+            }
+
+
+        case 'google/flan-t5-base':
+            return {
+                'qkv_proj': ['q', 'k', 'v'],
+                'attn_head': ['q', 'k', 'v', 'o'],
+                'attn_head_and_mlp': [
+                    'q', 'k', 'v', 'o',
+                    # FFN (cover both gated + non-gated)
+                    'wi', 'wo',
+                    'wi_0', 'wi_1',
+                ],
+                'attn_head_and_mlp_with_Q': [
+                    'q', 'k', 'v', 'o',
+                    'attn_shortcut_Q',
+                    'cross_attn_shortcut_Q',  # NEW for decoder cross-attn
+                    'wi', 'wo',
+                    'wi_0', 'wi_1',
+                    'mlp_shortcut_Q',
+                ],
+                'attn_head_mlp_lm_head_with_Q': [
+                    'q', 'k', 'v', 'o',
+                    'attn_shortcut_Q',
+                    'cross_attn_shortcut_Q',
+                    'wi', 'wo',
+                    'wi_0', 'wi_1',
+                    'mlp_shortcut_Q',
+                    'lm_head',
+                ],
+            }
+
         case _:
             raise RuntimeError(f'Lora target map undefined for model={model}')
+        
