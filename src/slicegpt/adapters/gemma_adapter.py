@@ -107,46 +107,23 @@ if HAS_GEMMA3:
         def forward(
             self,
             hidden_states: Tensor,
+            position_embeddings_global: Tensor,
+            position_embeddings_local: Tensor,
             attention_mask: Tensor | None = None,
             position_ids: LongTensor | None = None,
             past_key_value: tuple[Tensor] | None = None,
             output_attentions: bool | None = False,
             use_cache: bool | None = False,
             cache_position: Tensor | None = None,
-            position_embeddings: tuple[Tensor, Tensor] | None = None,
             **kwargs,
         ) -> tuple:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-            # Compute position_embeddings if not provided (Gemma 3 requirement)
-            # In Gemma 3, position embeddings must be computed before calling attention
-            if position_embeddings is None:
-                # Gemma 3 doesn't have rotary_emb in the attention layer
-                # We need to get it from the model level, but when calling layers individually
-                # we may not have access. Try to get it from kwargs or compute a default.
-                # As a workaround, use the attention's internal rotary computation if available
-                if hasattr(self.self_attn, 'rotary_emb'):
-                    # If rotary_emb exists in self_attn (unlikely for Gemma3)
-                    position_embeddings = self.self_attn.rotary_emb(hidden_states, position_ids)
-                elif 'position_embeddings' in kwargs:
-                    position_embeddings = kwargs.pop('position_embeddings')
-                else:
-                    # Last resort: create position embeddings with correct shape
-                    # This is a fallback that may not give perfect results but prevents crashes
-                    head_dim = self.self_attn.head_dim
-                    # Create cos/sin embeddings based on position_ids
-                    if position_ids is not None:
-                        # Use position_ids to create embeddings
-                        # This is a simplified version - ideally we'd use the actual rotary_emb
-                        device = hidden_states.device
-                        dtype = hidden_states.dtype
-                        # Create basic rotary embeddings
-                        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-                        t = position_ids.float()
-                        freqs = torch.einsum('bi,j->bij', t, inv_freq)
-                        emb = torch.cat((freqs, freqs), dim=-1)
-                        position_embeddings = (emb.cos().to(dtype), emb.sin().to(dtype))
+            if self.self_attn.is_sliding:
+                position_embeddings = position_embeddings_local
+            else:
+                position_embeddings = position_embeddings_global
 
             # Self Attention
             attn_output = self.self_attn(
