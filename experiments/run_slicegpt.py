@@ -157,7 +157,13 @@ def slicing_main(args: argparse.Namespace) -> None:
             # distribute model across available GPUs
             gpu_utils.distribute_model(model_adapter)
         else:
-            model.to(config.device)
+            # CRITICAL: Use in-place parameter movement to preserve compressed layer instances
+            # model.to(config.device) recreates modules, which replaces our CompressedGemma3TextDecoderLayer
+            # Instead, manually move parameters and buffers to device
+            for param in model.parameters():
+                param.data = param.data.to(config.device)
+            for buffer in model.buffers():
+                buffer.data = buffer.data.to(config.device)
 
     dataset = data_utils.get_dataset(args.cal_dataset)
     train_dataset, test_dataset = dataset["train"], dataset["test"]
@@ -256,6 +262,21 @@ def slicing_main(args: argparse.Namespace) -> None:
         logging.info(f"Saved sliced model to {args.save_dir}")
 
     reset_model_device()
+
+    # Debug: Check what layer types we have after slicing
+    logging.info(f"Layer types after slicing: {[type(layer).__name__ for layer in model.model.layers[:3]]}")
+
+    # Check if layers have the custom forward method
+    import sys
+    for i in range(min(3, len(model.model.layers))):
+        layer = model.model.layers[i]
+        print(f"\n[PRE-EVAL CHECK] Layer {i}: type={type(layer).__name__}, has_attn_shortcut_Q={hasattr(layer, 'attn_shortcut_Q')}", flush=True, file=sys.stderr)
+        if hasattr(layer, 'self_attn'):
+            q_out = layer.self_attn.q_proj.out_features if hasattr(layer.self_attn, 'q_proj') else 'N/A'
+            head_dim = getattr(layer.self_attn, 'head_dim', 'N/A')
+            num_heads = getattr(layer.self_attn, 'num_heads', None) or getattr(layer.self_attn, 'num_attention_heads', 'N/A')
+            print(f"[PRE-EVAL CHECK] Layer {i}: q_proj.out_features={q_out}, head_dim={head_dim}, num_heads={num_heads}", flush=True, file=sys.stderr)
+
     dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
     logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
     wandb.log({"sliced_ppl": dataset_ppl})

@@ -165,11 +165,52 @@ def create_compressed_gemma3_layer_class(base_layer_type):
             Forward pass with rotation support for SliceGPT.
             Note: Gemma 3 requires position_embeddings parameter.
             """
-            # Gemma 3 attention works with both 2D and 3D tensors naturally
-            # We just need to pass through without modification
+            # CRITICAL FIX: Force 3D structure to ensure consistent behavior
+            # Gemma 3 supports 1D [hidden], 2D [seq, hidden], and 3D [batch, seq, hidden] inputs,
+            # but position_embeddings are always generated as 3D [1, seq, head_dim].
+            # To avoid shape mismatches during attention, we force all inputs to be 3D.
+            # We track the original dimensionality to restore it at the end.
+            import sys
+            original_ndim = hidden_states.ndim
+            added_dims = False
+
+            if hidden_states.ndim == 1:
+                # 1D input [hidden] → add seq and batch dimensions
+                original_hidden_shape = hidden_states.shape
+                hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)  # [hidden] → [1, 1, hidden]
+                added_dims = True
+
+                # For 1D input, attention_mask might not make sense, but adjust if present
+                if attention_mask is not None and attention_mask.ndim == 4:
+                    original_mask_shape = attention_mask.shape
+                    attention_mask = attention_mask[:1]
+                    print(f"[FORCE_3D] Converted 1D→3D: hidden_states {original_hidden_shape}→{hidden_states.shape}, attention_mask {original_mask_shape}→{attention_mask.shape}", flush=True, file=sys.stderr)
+                else:
+                    print(f"[FORCE_3D] Converted 1D→3D: hidden_states {original_hidden_shape}→{hidden_states.shape}", flush=True, file=sys.stderr)
+
+            elif hidden_states.ndim == 2:
+                # 2D input [seq, hidden] → add batch dimension
+                original_hidden_shape = hidden_states.shape
+                hidden_states = hidden_states.unsqueeze(0)  # [seq, hidden] → [1, seq, hidden]
+                added_dims = True
+
+                # CRITICAL: Also adjust attention_mask to match the new batch size
+                # attention_mask typically has shape [batch, 1, seq, seq] or [batch, num_heads, seq, seq]
+                # When we force hidden_states to batch=1, we need attention_mask to also be batch=1
+                if attention_mask is not None and attention_mask.ndim == 4:
+                    original_mask_shape = attention_mask.shape
+                    # Take only the first element of the batch dimension
+                    # [batch, ...] → [1, ...]
+                    attention_mask = attention_mask[:1]
+                    print(f"[FORCE_3D] Converted 2D→3D: hidden_states {original_hidden_shape}→{hidden_states.shape}, attention_mask {original_mask_shape}→{attention_mask.shape}", flush=True, file=sys.stderr)
+                else:
+                    print(f"[FORCE_3D] Converted 2D→3D: hidden_states {original_hidden_shape}→{hidden_states.shape}, attention_mask=None or wrong ndim", flush=True, file=sys.stderr)
+
             residual = hidden_states
+            print(f"[DEBUG] After adding batch dim (if needed): hidden_states.shape={hidden_states.shape}, residual.shape={residual.shape}", flush=True, file=sys.stderr)
 
             hidden_states = self.input_layernorm(hidden_states)
+            print(f"[DEBUG] After input_layernorm: hidden_states.shape={hidden_states.shape}, ndim={hidden_states.ndim}", flush=True, file=sys.stderr)
 
             # Gemma 3 requires position_embeddings - if not provided, compute them
             # This happens when layers are called individually (e.g., during SliceGPT rotation)
@@ -208,45 +249,14 @@ def create_compressed_gemma3_layer_class(base_layer_type):
                     pass
 
             # Self Attention - pass position_embeddings for Gemma 3
-            # After slicing, we need to adjust position_embeddings to match the sliced head_dim
+            # Since we've forced 3D structure, position_embeddings [1, seq, head_dim] will broadcast correctly
 
-            if position_embeddings is not None and isinstance(position_embeddings, (tuple, list)):
-                cos, sin = position_embeddings
-
-                # CRITICAL FIX: Position embeddings must match q_proj output dimension after reshaping
-                #
-                # The KEY insight: Even though hidden_states are sliced (e.g., 544 dims),
-                # q_proj OUTPUT is NOT sliced (still 1024 dims in our approach).
-                # When Gemma3Attention reshapes queries to [batch, seq, num_heads, head_dim],
-                # it uses head_dim = q_proj.out_features / num_heads = 1024 / 4 = 256
-                #
-                # So position embeddings must have dim 256, NOT dim based on hidden_states!
-                #
-                # Strategy: Compute head_dim from q_proj.out_features, not hidden_states
-
-                # Get num_heads - this is constant and doesn't change with slicing
-                num_heads = getattr(self.self_attn, 'num_heads', None)
-                if num_heads is None:
-                    # For Gemma 3, compute from q_proj and head_dim
-                    q_proj_out = getattr(self.self_attn.q_proj, 'out_features', 1024)
-                    original_head_dim = getattr(self.self_attn, 'head_dim', 256)
-                    num_heads = q_proj_out // original_head_dim
-                    # For Gemma 3 270M: 1024 / 256 = 4
-
-                # Compute ACTUAL head_dim from q_proj output, not hidden_states!
-                # This is what Gemma3Attention will use when reshaping queries
-                q_proj_out_features = getattr(self.self_attn.q_proj, 'out_features', 1024)
-                actual_head_dim = q_proj_out_features // num_heads
-                # For unsliced q_proj: 1024 / 4 = 256 (matches original)
-                # For sliced q_proj: 544 / 4 = 136 (would be different, but we don't slice q_proj!)
-
-                # Slice position_embeddings ONLY if q_proj was sliced and head_dim changed
-                # In our current approach, q_proj is NOT sliced, so head_dim stays 256
-                if cos.shape[-1] != actual_head_dim:
-                    position_embeddings = (cos[..., :actual_head_dim], sin[..., :actual_head_dim])
-                    # Debug output
-                    import sys
-                    print(f"[POS_EMB_SLICE] Sliced position embeddings from {cos.shape} to {position_embeddings[0].shape}, q_proj.out_features={q_proj_out_features}, num_heads={num_heads}, actual_head_dim={actual_head_dim}", flush=True, file=sys.stderr)
+            # Debug logging to track tensor shapes
+            print(f"[DEBUG] Before self_attn: hidden_states.shape={hidden_states.shape}, ndim={hidden_states.ndim}", flush=True, file=sys.stderr)
+            if attention_mask is not None:
+                print(f"[DEBUG] Before self_attn: attention_mask.shape={attention_mask.shape}", flush=True, file=sys.stderr)
+            if position_embeddings is not None:
+                print(f"[DEBUG] Before self_attn: position_embeddings shapes={[t.shape for t in position_embeddings] if isinstance(position_embeddings, (tuple, list)) else position_embeddings.shape}", flush=True, file=sys.stderr)
 
             try:
                 attn_output = self.self_attn(
@@ -260,6 +270,7 @@ def create_compressed_gemma3_layer_class(base_layer_type):
                     cache_position=cache_position,
                     **kwargs,
                 )
+                print(f"[DEBUG] After self_attn: attn_output type={type(attn_output)}, shape={attn_output.shape if hasattr(attn_output, 'shape') else 'N/A'}", flush=True, file=sys.stderr)
             except RuntimeError as e:
                 # Re-raise with more context for debugging
                 raise RuntimeError(
@@ -292,6 +303,18 @@ def create_compressed_gemma3_layer_class(base_layer_type):
                 hidden_states = rotated_residual + hidden_states
             else:
                 hidden_states = residual + hidden_states
+
+            # Restore original dimensionality by removing dimensions we added
+            if added_dims:
+                if original_ndim == 1:
+                    # Was 1D, restore to 1D: [1, 1, hidden] → [hidden]
+                    hidden_states = hidden_states.squeeze(0).squeeze(0)
+                    print(f"[FORCE_3D] Restored 3D→1D: hidden_states.shape={hidden_states.shape}", flush=True, file=sys.stderr)
+                elif original_ndim == 2:
+                    # Was 2D, restore to 2D: [1, seq, hidden] → [seq, hidden]
+                    hidden_states = hidden_states.squeeze(0)
+                    print(f"[FORCE_3D] Restored 3D→2D: hidden_states.shape={hidden_states.shape}", flush=True, file=sys.stderr)
+                # If original_ndim == 3, no change needed - already 3D
 
             return hidden_states
 
