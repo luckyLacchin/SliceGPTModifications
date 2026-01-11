@@ -28,17 +28,34 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
     for W in model_adapter.get_embeddings():
         W.weight = torch.nn.Parameter(W.weight.to(config.device))
 
+    layer0_adapter = model_adapter.get_layers()[0]
+    original_layer0 = layer0_adapter.layer
+
     class Catcher(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, original_layer):
             super().__init__()
+            # Copy any attributes from the original layer that might be accessed
+            # (e.g., attention_type in Gemma 3)
+            for attr_name in dir(original_layer):
+                if not attr_name.startswith('_') and not callable(getattr(original_layer, attr_name, None)):
+                    try:
+                        setattr(self, attr_name, getattr(original_layer, attr_name))
+                    except (AttributeError, TypeError):
+                        # Skip attributes that can't be copied
+                        pass
 
         def forward(self, *args, **kwargs):
             self.saved_args = args
             self.saved_kwargs = kwargs
             raise ValueError
 
-    layer0_adapter = model_adapter.get_layers()[0]
-    layer0_catcher = Catcher()
+    layer0_catcher = Catcher(original_layer0)
+
+    # For Gemma 3: inject rotary_emb reference from model level
+    # Gemma 3 has a shared rotary_emb at model.model.rotary_emb
+    if hasattr(model_adapter.model, 'model') and hasattr(model_adapter.model.model, 'rotary_emb'):
+        layer0_catcher.rotary_emb = model_adapter.model.model.rotary_emb
+
     model_adapter.set_raw_layer_at(0, layer0_catcher)
 
     try:

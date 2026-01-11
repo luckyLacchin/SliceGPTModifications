@@ -212,6 +212,17 @@ def rotate_and_slice_sequential(
             layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
         )
 
+        # CRITICAL: For Gemma 3 GQA, DON'T slice q/k/v projection outputs!
+        # The attention mechanism keeps its full internal dimensions
+        # Only the hidden states (residual stream) are compressed
+        # Position embeddings slicing in forward() handles dimension mismatches
+        # if hasattr(layer_adapter, 'slice_attention_output_projections'):
+        #     layer_adapter.slice_attention_output_projections(
+        #         slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+        #     )
+        #     if hasattr(layer, '_update_head_dim_hook'):
+        #         layer._update_head_dim_hook()
+
         layer.mlp_shortcut_Q = nn.Parameter(
             Q.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
         )
@@ -337,6 +348,12 @@ def rotate_and_slice_parallel(
         rotate_attention_output(layer_adapter, Q)
         slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
         slice_attention_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
+
+        # CRITICAL: For Gemma 3 GQA, DON'T slice q/k/v projection outputs!
+        # if hasattr(layer_adapter, 'slice_attention_output_projections'):
+        #     layer_adapter.slice_attention_output_projections(slicing_scheduler.get_mlp_output_dimension(idx))
+        #     if hasattr(layer, '_update_head_dim_hook'):
+        #         layer._update_head_dim_hook()
 
         # slice the shortcut (there is only one, we use attn_shortcut buffer)
         layer.attn_shortcut_Q = nn.Parameter(
@@ -470,6 +487,13 @@ def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingS
             slice_attention_output(
                 layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True)
             )
+            # CRITICAL: For Gemma 3 GQA, DON'T slice q/k/v projection outputs!
+            # if hasattr(layer_adapter, 'slice_attention_output_projections'):
+            #     layer_adapter.slice_attention_output_projections(
+            #         slicing_scheduler.get_attention_output_dimension(i, match_head_dim=True)
+            #     )
+            #     if hasattr(layer, '_update_head_dim_hook'):
+            #         layer._update_head_dim_hook()
         else:  # sequential case
             layer.attn_shortcut_Q = nn.Parameter(
                 layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)]
@@ -482,6 +506,13 @@ def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingS
             slice_attention_output(
                 layer_adapter, slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)
             )
+            # CRITICAL: For Gemma 3 GQA, DON'T slice q/k/v projection outputs!
+            # if hasattr(layer_adapter, 'slice_attention_output_projections'):
+            #     layer_adapter.slice_attention_output_projections(
+            #         slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)
+            #     )
+            #     if hasattr(layer, '_update_head_dim_hook'):
+            #         layer._update_head_dim_hook()
 
     if slicing_scheduler.do_slice_head:
         slice_head(model_adapter, slicing_scheduler.get_head_dimension())
@@ -517,10 +548,52 @@ def pca_calc(
         H_batch = torch.sum(X_batch.mT @ X_batch, dim=0)  # sum over the batch dimension.
         H = H_batch if H is None else H + H_batch
 
-    damp = 0.01 * torch.mean(torch.diag(H))
+    # Check for numerical issues and normalize if needed
     diag = torch.arange(H.shape[-1]).to(device=config.device)
+
+    # Handle extreme numerical issues (inf, nan)
+    if torch.isnan(H).any() or torch.isinf(H).any():
+        logging.warning(f"Matrix contains NaN or Inf values, replacing with scaled identity")
+        # If matrix is completely corrupted, use identity (PCA will return identity rotation)
+        H = torch.eye(H.shape[0], device=H.device, dtype=H.dtype)
+        H_diag_mean = 1.0
+    else:
+        H_diag_mean = torch.mean(torch.diag(H))
+        # If the matrix is too small, normalize it
+        if H_diag_mean < 1e-6:
+            logging.warning(f"Matrix has very small values (mean diag: {H_diag_mean}), applying normalization")
+            # Scale the matrix to improve conditioning
+            H = H / torch.clamp(H_diag_mean, min=1e-6)
+            H_diag_mean = torch.mean(torch.diag(H))
+
+    # Add dampening for numerical stability (adaptive based on matrix scale)
+    damp = 0.01 * H_diag_mean
     H[diag, diag] = H[diag, diag] + damp
-    X_eig = torch.linalg.eigh(H)
+
+    # Try eigendecomposition with error handling
+    try:
+        X_eig = torch.linalg.eigh(H)
+    except torch._C._LinAlgError:
+        # If eigh fails, add more dampening and try again
+        logging.warning("Initial eigendecomposition failed, increasing dampening factor")
+        damp = 0.1 * H_diag_mean
+        H[diag, diag] = H[diag, diag] + damp * 10
+        try:
+            X_eig = torch.linalg.eigh(H)
+        except torch._C._LinAlgError:
+            # If still failing, use very aggressive dampening
+            logging.warning("Second eigendecomposition failed, using aggressive dampening")
+            damp_aggressive = 1.0 * H_diag_mean
+            H[diag, diag] = H[diag, diag] + damp_aggressive * 100
+            try:
+                X_eig = torch.linalg.eigh(H)
+            except torch._C._LinAlgError:
+                # Last resort: regularize with identity matrix
+                logging.warning("All eigendecomposition attempts failed, using identity regularization")
+                reg_strength = torch.max(torch.diag(H)) * 0.5
+                H = H + torch.eye(H.shape[0], device=H.device, dtype=H.dtype) * reg_strength
+                X_eig = torch.linalg.eigh(H)
+
     del H
     index = torch.argsort(X_eig[0], descending=True)
     eig_val = X_eig[0][index]
