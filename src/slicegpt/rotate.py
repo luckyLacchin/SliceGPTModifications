@@ -127,14 +127,14 @@ def rotate_and_slice(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> None:
+) -> list[dict]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
     """
     if model_adapter.parallel_blocks:
-        rotate_and_slice_parallel(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
+        return rotate_and_slice_parallel(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
     else:
-        rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
+        return rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
 
 
 @torch.no_grad()
@@ -144,7 +144,7 @@ def rotate_and_slice_sequential(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> None:
+) -> list[dict]:
     """
     Rotate and slice the provided model, with interleaved slicing and PCA calculations.
 
@@ -165,6 +165,8 @@ def rotate_and_slice_sequential(
     layers = model_adapter.get_layers()
     slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=False)
 
+    rotation_matrices = []
+
     # rotate and slice embeddings
     eig_val, Q = pca_calc(inps, ignore_masks)
     Q = Q.to(device=config.device)
@@ -173,6 +175,14 @@ def rotate_and_slice_sequential(
         Q = Q @ R.to(Q.device)
     rotate_embeddings(model_adapter, Q)
     slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+
+    rotation_matrices.append({
+        "type": "embedding",
+        "layer_type": "sequential",
+        "layer": -1,
+        "eigenvalues": eig_val.cpu(),
+        "eigenvectors": Q.cpu(),
+    })
 
     logging.info("Rotate and slice layers")
     for idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Rotating and slicing")):
@@ -200,6 +210,14 @@ def rotate_and_slice_sequential(
                 Q.shape[0], slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
             )
             Q = Q @ R.to(Q.device)
+
+        rotation_matrices.append({
+            "type": "attn_output",
+            "layer_type": "sequential",
+            "layer": idx,
+            "eigenvalues": eig_val.cpu(),
+            "eigenvectors": Q.cpu(),
+        })
 
         layer.attn_shortcut_Q = nn.Parameter(
             torch.matmul(
@@ -229,6 +247,14 @@ def rotate_and_slice_sequential(
             R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
             Q = Q @ R.to(Q.device)
 
+        rotation_matrices.append({
+            "type": "mlp_output",
+            "layer_type": "sequential",
+            "layer": idx,
+            "eigenvalues": eig_val.cpu(),
+            "eigenvectors": Q.cpu(),
+        })
+
         layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q.to(dtype=dtype)))
 
         # optionally slice the mlp/head connection in the last layer
@@ -250,6 +276,8 @@ def rotate_and_slice_sequential(
     model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
     logging.info("Rotate and slice layers done")
 
+    return rotation_matrices
+
 
 @torch.no_grad()
 def rotate_and_slice_parallel(
@@ -258,7 +286,7 @@ def rotate_and_slice_parallel(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> None:
+) -> list[dict]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
 
@@ -279,14 +307,24 @@ def rotate_and_slice_parallel(
     layers = model_adapter.get_layers()
     slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=True)
 
+    rotation_matrices = []
+
     # rotate and slice embeddings
-    _, Q = pca_calc(inps, ignore_masks)
+    eig_val, Q = pca_calc(inps, ignore_masks)
     Q = Q.to(device=config.device)
     if final_orientation == 'random':
         R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
         Q = Q @ R.to(Q.device)
     rotate_embeddings(model_adapter, Q)
     slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+
+    rotation_matrices.append({
+        "type": "embedding",
+        "layer_type": "parallel",
+        "layer": -1,
+        "eigenvalues": eig_val.cpu(),
+        "eigenvectors": Q.cpu(),
+    })
 
     logging.info("Rotate and slice layers")
     layers = model_adapter.get_layers()
@@ -323,11 +361,19 @@ def rotate_and_slice_parallel(
             outputs.append(out)
 
         inps = outputs
-        _, Q = pca_calc(inps, ignore_masks)
+        eig_val, Q = pca_calc(inps, ignore_masks)
 
         if final_orientation == 'random':
             R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
             Q = Q @ R.to(Q.device)
+
+        rotation_matrices.append({
+            "type": "layer_output",
+            "layer_type": "parallel",
+            "layer": idx,
+            "eigenvalues": eig_val.cpu(),
+            "eigenvectors": Q.cpu(),
+        })
 
         # update shortcut matrix
         layer.attn_shortcut_Q = nn.Parameter(torch.matmul(layer.attn_shortcut_Q, Q.to(dtype=dtype)))
@@ -356,6 +402,8 @@ def rotate_and_slice_parallel(
     # update model's slicing config
     model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
     logging.info("Rotate and slice layers done")
+
+    return rotation_matrices
 
 
 @torch.no_grad()
