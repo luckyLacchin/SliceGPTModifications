@@ -221,6 +221,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         f"New embedding dimension: {new_embedding_dimension} (sparsity {100*(1 - new_embedding_dimension / model_adapter.hidden_size):.4f} %)"
     )
 
+    logging.info("Saving rotation matrices is enabled.")
     scheduler = ConstSlicingScheduler(new_embedding_dimension)
     rotation_matrices = rotate.rotate_and_slice(model_adapter, train_loader, scheduler, final_orientation=args.final_orientation)
 
