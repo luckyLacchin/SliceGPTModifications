@@ -14,7 +14,7 @@ def get_dataset(name: str) -> datasets.DatasetDict:
     Get the dataset from the HuggingFace datasets library.
 
     Args:
-        name: The name of the HuggingFace dataset to load. Must be one of "wikitext2", "ptb", "c4" or "alpaca".
+        name: The name of the HuggingFace dataset to load. Must be one of "wikitext2", "ptb", "c4", "alpaca", "squad", "hotpotqa", or "coqa".
 
     Returns:
         The dataset.
@@ -36,6 +36,14 @@ def get_dataset(name: str) -> datasets.DatasetDict:
         "alpaca": {"path": "tatsu-lab/alpaca", "cols_to_remove": ['input', 'output', 'instruction']},
         "squad": {
             "path": "rajpurkar/squad",
+            "config_name": None,
+        },
+        "hotpotqa": {
+            "path": "hotpotqa/hotpot_qa",
+            "config_name": "distractor",
+        },
+        "coqa": {
+            "path": "stanfordnlp/coqa",
             "config_name": None,
         }
     }
@@ -67,12 +75,51 @@ def get_dataset(name: str) -> datasets.DatasetDict:
 
         ds = ds.map(combine)
         ds = ds.remove_columns(["id", "title", "context", "question", "answers"])
-        
+
         #in Squad is missing the test set, so we are creating it from the validation set
         if "test" not in ds:
             temp = ds["validation"].train_test_split(test_size=0.5, seed=42)
             ds["validation"] = temp["train"]
             ds["test"] = temp["test"]
+
+    # HotpotQA preprocessing: combine context paragraphs with question
+    if name == "hotpotqa":
+        def combine_hotpotqa(batch):
+            # Flatten all context sentences from all documents into one text
+            contexts = []
+            for doc_sentences in batch["context"]["sentences"]:
+                contexts.extend(doc_sentences)
+            context_text = " ".join(contexts)
+            batch["text"] = context_text + "\n\n" + batch["question"]
+            return batch
+
+        ds = ds.map(combine_hotpotqa)
+        ds = ds.remove_columns(["id", "question", "answer", "type", "level", "supporting_facts", "context"])
+
+        # HotpotQA distractor config has no test set, create from validation
+        if "test" not in ds:
+            temp = ds["validation"].train_test_split(test_size=0.5, seed=42)
+            ds["validation"] = temp["train"]
+            ds["test"] = temp["test"]
+
+    # CoQA preprocessing: combine story with questions
+    if name == "coqa":
+        def combine_coqa(batch):
+            # CoQA has conversational questions, combine story with all questions
+            story = batch["story"]
+            questions_text = "\n".join(batch["questions"])
+            batch["text"] = story + "\n\n" + questions_text
+            return batch
+
+        ds = ds.map(combine_coqa)
+        ds = ds.remove_columns(["source", "story", "questions", "answers"])
+
+        # CoQA has no test set, create from validation
+        if "test" not in ds:
+            temp = ds["validation"].train_test_split(test_size=0.5, seed=42)
+            ds["validation"] = temp["train"]
+            ds["test"] = temp["test"]
+
     logging.info("Loading dataset done")
     return ds
 
