@@ -107,36 +107,6 @@ class LayerAdapter(ABC):
             args[: self.hidden_states_args_position] + (hidden_states,) + args[self.hidden_states_args_position + 1 :]
         )
 
-    @property
-    @abstractmethod
-    def has_cross_attention(self) -> bool:
-        """True for decoder layers with cross-attention (e.g., T5 decoder blocks)."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_cross_attention_layernorm(self) -> Module:
-        """
-        Returns the layer norm before the cross-attention component.
-        If has_cross_attention is False, should raise.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_cross_attention_q_input(self) -> Linear:
-        """Linear layer that produces Q for cross-attention (input: decoder hidden states)."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_cross_attention_kv_inputs(self) -> Sequence[Linear]:
-        """Linear layers that produce K and V for cross-attention (input: encoder hidden states)."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_cross_attention_output(self) -> Linear:
-        """Linear layer that is the output projection of cross-attention."""
-        raise NotImplementedError
-
-
 
 class ModelAdapter(ABC):
     """
@@ -324,11 +294,7 @@ class ModelAdapter(ABC):
         compressed_layer = self.convert_layer_to_compressed(layer, layer_idx)
         if not self.parallel_blocks:
             compressed_layer.register_parameter('mlp_shortcut_Q', None)
-        
         compressed_layer.register_parameter('attn_shortcut_Q', None)
-        
-        compressed_layer.register_parameter('cross_attn_shortcut_Q', None)
-        
         return compressed_layer
 
     def post_init(self, tokenizer: PreTrainedTokenizerBase) -> None:

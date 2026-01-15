@@ -2,23 +2,22 @@
 # Licensed under the MIT license.
 #
 # This file contains derivations from
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py
+# Copyright 2024 Alibaba Inc. and the HuggingFace Inc. team. All rights reserved.
 # https://www.apache.org/licenses/LICENSE-2.0
 
 import torch
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
-from transformers.models.llama.modeling_llama import LlamaConfig, LlamaDecoderLayer, LlamaForCausalLM, LlamaRMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Config, Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2RMSNorm
 
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
 
-class CompressedLlamaDecoderLayer(LlamaDecoderLayer):
+class CompressedQwen2DecoderLayer(Qwen2DecoderLayer):
     """
-    This class simulates the LlamaDecoderLayer class from transformers
-    (https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L376)
+    This class simulates the Qwen2DecoderLayer class from transformers
     but with the addition of a shortcut_Q attribute. This attribute is used to rotate the residual tensors.
     """
 
@@ -45,7 +44,6 @@ class CompressedLlamaDecoderLayer(LlamaDecoderLayer):
                 (see `past_key_values`).
             past_key_value (`tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -60,6 +58,7 @@ class CompressedLlamaDecoderLayer(LlamaDecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
+
         if self.attn_shortcut_Q is not None:
             rotated_residual = matmul(residual, self.attn_shortcut_Q)
             hidden_states = rotated_residual + hidden_states
@@ -88,10 +87,10 @@ class CompressedLlamaDecoderLayer(LlamaDecoderLayer):
         return outputs
 
 
-class LlamaLayerAdapter(LayerAdapter):
-    def __init__(self, layer: LlamaDecoderLayer) -> None:
+class Qwen2LayerAdapter(LayerAdapter):
+    def __init__(self, layer: Qwen2DecoderLayer) -> None:
         super().__init__()
-        self._layer: LlamaDecoderLayer = layer
+        self._layer: Qwen2DecoderLayer = layer
 
     @property
     def layer(self) -> Module:
@@ -124,10 +123,10 @@ class LlamaLayerAdapter(LayerAdapter):
         return self.layer.mlp.down_proj
 
 
-class LlamaModelAdapter(ModelAdapter):
-    def __init__(self, model: LlamaForCausalLM) -> None:
+class Qwen2ModelAdapter(ModelAdapter):
+    def __init__(self, model: Qwen2ForCausalLM) -> None:
         super().__init__()
-        self._model: LlamaForCausalLM = model
+        self._model: Qwen2ForCausalLM = model
 
     @property
     def model(self) -> Module:
@@ -139,7 +138,7 @@ class LlamaModelAdapter(ModelAdapter):
 
     @property
     def config_type(self) -> type:
-        return LlamaConfig
+        return Qwen2Config
 
     @property
     def parallel_blocks(self) -> bool:
@@ -159,19 +158,19 @@ class LlamaModelAdapter(ModelAdapter):
 
     @property
     def original_layer_type(self) -> type:
-        return LlamaDecoderLayer
+        return Qwen2DecoderLayer
 
     @property
     def original_layer_norm_type(self) -> type:
-        return LlamaRMSNorm
+        return Qwen2RMSNorm
 
     @property
     def layer_adapter_type(self) -> type:
-        return LlamaLayerAdapter
+        return Qwen2LayerAdapter
 
     @property
     def compressed_layer_type(self) -> type:
-        return CompressedLlamaDecoderLayer
+        return CompressedQwen2DecoderLayer
 
     @property
     def use_cache(self) -> bool:
@@ -210,9 +209,10 @@ class LlamaModelAdapter(ModelAdapter):
         return self.model.lm_head
 
     def post_init(self, tokenizer: PreTrainedTokenizerBase) -> None:
-        # Llama-2 and Llama-3 don't have a pad tokens by default
-        tokenizer.pad_token = tokenizer.eos_token
-        self.config.pad_token_id = tokenizer.pad_token_id
+        # Qwen2 may not have a pad token by default
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            self.config.pad_token_id = tokenizer.pad_token_id
 
     @classmethod
     def _from_pretrained(
@@ -224,15 +224,15 @@ class LlamaModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not model_name.startswith("Qwen/Qwen2"):
             return None
 
-        model = LlamaForCausalLM.from_pretrained(
+        model = Qwen2ForCausalLM.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
         model.config.torch_dtype = dtype
 
-        return LlamaModelAdapter(model)
+        return Qwen2ModelAdapter(model)
 
     @classmethod
     def _from_uninitialized(
@@ -244,18 +244,18 @@ class LlamaModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not model_name.startswith("Qwen/Qwen2"):
             return None
 
-        class UninitializedLlamaForCausalLM(LlamaForCausalLM):
+        class UninitializedQwen2ForCausalLM(Qwen2ForCausalLM):
             def _init_weights(self, _) -> None:
                 # Prevent weight initialization
                 pass
 
-        config = LlamaConfig.from_pretrained(
+        config = Qwen2Config.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
-        model = UninitializedLlamaForCausalLM(config)
+        model = UninitializedQwen2ForCausalLM(config)
         model = model.to(dtype=dtype)
 
-        return LlamaModelAdapter(model)
+        return Qwen2ModelAdapter(model)

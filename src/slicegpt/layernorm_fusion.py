@@ -84,13 +84,10 @@ def fuse_modules(model_adapter: ModelAdapter) -> None:
     head = model_adapter.get_lm_head()
     head.weight = Parameter(head.weight.clone())
 
-    # CRITICAL FIX: Only subtract mean for models that use LayerNorm (not RMSNorm)
-    # T5 uses RMSNorm which does NOT subtract mean!
-    if model_adapter.should_bake_mean_into_linear:
-        # We add the mean subtraction to the first embeddings
-        for W in model_adapter.get_embeddings():
-            W_ = W.weight.data.double()
-            W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
+    # We add the mean subtraction to the first embeddings
+    for W in model_adapter.get_embeddings():
+        W_ = W.weight.data.double()
+        W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
 
     layers = model_adapter.get_layers()
 
