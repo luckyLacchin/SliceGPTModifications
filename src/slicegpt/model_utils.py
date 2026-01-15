@@ -29,8 +29,15 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
         W.weight = torch.nn.Parameter(W.weight.to(config.device))
 
     class Catcher(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, wrapped: torch.nn.Module):
             super().__init__()
+            self._wrapped = wrapped
+
+        def __getattr__(self, name: str):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self._wrapped, name)
 
         def forward(self, *args, **kwargs):
             self.saved_args = args
@@ -38,7 +45,7 @@ def get_layer0_inputs(model_adapter: ModelAdapter, batch: Tensor) -> tuple[Tenso
             raise ValueError
 
     layer0_adapter = model_adapter.get_layers()[0]
-    layer0_catcher = Catcher()
+    layer0_catcher = Catcher(layer0_adapter.layer)
     model_adapter.set_raw_layer_at(0, layer0_catcher)
 
     try:

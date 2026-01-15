@@ -54,7 +54,7 @@ class CompressedGemma2DecoderLayer(Gemma2DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -63,6 +63,21 @@ class CompressedGemma2DecoderLayer(Gemma2DecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
+        self_attn_weights = None
+        present_key_value = None
+        if isinstance(attn_outputs, tuple):
+            if len(attn_outputs) == 3:
+                hidden_states, self_attn_weights, present_key_value = attn_outputs
+            elif len(attn_outputs) == 2:
+                hidden_states, second = attn_outputs
+                if isinstance(second, (tuple, list)):
+                    present_key_value = second
+                else:
+                    self_attn_weights = second
+            else:
+                hidden_states = attn_outputs[0]
+        else:
+            hidden_states = attn_outputs
 
         if self.attn_shortcut_Q is not None:
             rotated_residual = matmul(residual, self.attn_shortcut_Q)
