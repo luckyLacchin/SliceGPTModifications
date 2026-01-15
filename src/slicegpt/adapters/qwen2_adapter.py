@@ -2,22 +2,22 @@
 # Licensed under the MIT license.
 #
 # This file contains derivations from
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py
-# Copyright 2025 Alibaba Inc. and the HuggingFace Inc. team. All rights reserved.
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py
+# Copyright 2024 Alibaba Inc. and the HuggingFace Inc. team. All rights reserved.
 # https://www.apache.org/licenses/LICENSE-2.0
 
 import torch
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Config, Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Config, Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2RMSNorm
 
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
 
-class CompressedQwen3DecoderLayer(Qwen3DecoderLayer):
+class CompressedQwen2DecoderLayer(Qwen2DecoderLayer):
     """
-    This class simulates the Qwen3DecoderLayer class from transformers
+    This class simulates the Qwen2DecoderLayer class from transformers
     but with the addition of a shortcut_Q attribute. This attribute is used to rotate the residual tensors.
     """
 
@@ -44,17 +44,12 @@ class CompressedQwen3DecoderLayer(Qwen3DecoderLayer):
                 (see `past_key_values`).
             past_key_value (`tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-        # Handle case where hidden_states is passed as a tuple (from previous layer output)
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # Qwen3 attention returns (hidden_states, attn_weights) - cache is handled internally
-        attn_output = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -63,12 +58,6 @@ class CompressedQwen3DecoderLayer(Qwen3DecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
-        # Handle both 2-tuple and 3-tuple returns for compatibility
-        # Note: cache is handled internally by DynamicCache in newer transformers
-        if len(attn_output) == 2:
-            hidden_states, self_attn_weights = attn_output
-        else:
-            hidden_states, self_attn_weights, _ = attn_output
 
         if self.attn_shortcut_Q is not None:
             rotated_residual = matmul(residual, self.attn_shortcut_Q)
@@ -87,19 +76,21 @@ class CompressedQwen3DecoderLayer(Qwen3DecoderLayer):
         else:
             hidden_states = residual + hidden_states
 
-        # Qwen3Model with DynamicCache expects decoder layer to return just hidden_states
-        # The cache is updated in-place by self.self_attn, not returned
-        # Only return attention weights if explicitly requested
+        outputs = (hidden_states,)
+
         if output_attentions:
-            return hidden_states, self_attn_weights
+            outputs += (self_attn_weights,)
 
-        return hidden_states
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
 
 
-class Qwen3LayerAdapter(LayerAdapter):
-    def __init__(self, layer: Qwen3DecoderLayer) -> None:
+class Qwen2LayerAdapter(LayerAdapter):
+    def __init__(self, layer: Qwen2DecoderLayer) -> None:
         super().__init__()
-        self._layer: Qwen3DecoderLayer = layer
+        self._layer: Qwen2DecoderLayer = layer
 
     @property
     def layer(self) -> Module:
@@ -132,10 +123,10 @@ class Qwen3LayerAdapter(LayerAdapter):
         return self.layer.mlp.down_proj
 
 
-class Qwen3ModelAdapter(ModelAdapter):
-    def __init__(self, model: Qwen3ForCausalLM) -> None:
+class Qwen2ModelAdapter(ModelAdapter):
+    def __init__(self, model: Qwen2ForCausalLM) -> None:
         super().__init__()
-        self._model: Qwen3ForCausalLM = model
+        self._model: Qwen2ForCausalLM = model
 
     @property
     def model(self) -> Module:
@@ -147,7 +138,7 @@ class Qwen3ModelAdapter(ModelAdapter):
 
     @property
     def config_type(self) -> type:
-        return Qwen3Config
+        return Qwen2Config
 
     @property
     def parallel_blocks(self) -> bool:
@@ -167,19 +158,19 @@ class Qwen3ModelAdapter(ModelAdapter):
 
     @property
     def original_layer_type(self) -> type:
-        return Qwen3DecoderLayer
+        return Qwen2DecoderLayer
 
     @property
     def original_layer_norm_type(self) -> type:
-        return Qwen3RMSNorm
+        return Qwen2RMSNorm
 
     @property
     def layer_adapter_type(self) -> type:
-        return Qwen3LayerAdapter
+        return Qwen2LayerAdapter
 
     @property
     def compressed_layer_type(self) -> type:
-        return CompressedQwen3DecoderLayer
+        return CompressedQwen2DecoderLayer
 
     @property
     def use_cache(self) -> bool:
@@ -218,7 +209,7 @@ class Qwen3ModelAdapter(ModelAdapter):
         return self.model.lm_head
 
     def post_init(self, tokenizer: PreTrainedTokenizerBase) -> None:
-        # Qwen3 may not have a pad token by default
+        # Qwen2 may not have a pad token by default
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             self.config.pad_token_id = tokenizer.pad_token_id
@@ -233,15 +224,15 @@ class Qwen3ModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not model_name.startswith("Qwen/Qwen3"):
+        if not model_name.startswith("Qwen/Qwen2"):
             return None
 
-        model = Qwen3ForCausalLM.from_pretrained(
+        model = Qwen2ForCausalLM.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
         model.config.torch_dtype = dtype
 
-        return Qwen3ModelAdapter(model)
+        return Qwen2ModelAdapter(model)
 
     @classmethod
     def _from_uninitialized(
@@ -253,18 +244,18 @@ class Qwen3ModelAdapter(ModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not model_name.startswith("Qwen/Qwen3"):
+        if not model_name.startswith("Qwen/Qwen2"):
             return None
 
-        class UninitializedQwen3ForCausalLM(Qwen3ForCausalLM):
+        class UninitializedQwen2ForCausalLM(Qwen2ForCausalLM):
             def _init_weights(self, _) -> None:
                 # Prevent weight initialization
                 pass
 
-        config = Qwen3Config.from_pretrained(
+        config = Qwen2Config.from_pretrained(
             model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
         )
-        model = UninitializedQwen3ForCausalLM(config)
+        model = UninitializedQwen2ForCausalLM(config)
         model = model.to(dtype=dtype)
 
-        return Qwen3ModelAdapter(model)
+        return Qwen2ModelAdapter(model)
