@@ -38,6 +38,10 @@ def get_dataset(name: str) -> datasets.DatasetDict:
             "path": "rajpurkar/squad",
             "config_name": None,
         },
+        "squad2": {
+            "path": "rajpurkar/squad_v2",
+            "config_name": None,
+        },
         "hotpotqa": {
             "path": "hotpotqa/hotpot_qa",
             "config_name": "distractor",
@@ -68,7 +72,7 @@ def get_dataset(name: str) -> datasets.DatasetDict:
         ds["validation"] = temp_ds["test"]
         
     #we have a problem, SliceGPT expects dataset to be of type DatasetDict, but squad has context, question, answers columns, so we have  to fix it
-    if name == "squad":
+    if name == "squad" or name == "squad2":
         def combine(batch):
             batch["text"] = batch["context"] + "\n\n" + batch["question"]
             return batch
