@@ -127,14 +127,19 @@ def rotate_and_slice(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> list[dict]:
+    save_hidden_states: bool = False,
+) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
+
+    Returns:
+        rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
+        hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
     """
     if model_adapter.parallel_blocks:
-        return rotate_and_slice_parallel(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
+        return rotate_and_slice_parallel(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation, save_hidden_states)
     else:
-        return rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
+        return rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation, save_hidden_states)
 
 
 @torch.no_grad()
@@ -144,11 +149,16 @@ def rotate_and_slice_sequential(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> list[dict]:
+    save_hidden_states: bool = False,
+) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice the provided model, with interleaved slicing and PCA calculations.
 
     This method works for models where the MLP block is computed after the attention block.
+
+    Returns:
+        rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
+        hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
     """
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
@@ -166,6 +176,12 @@ def rotate_and_slice_sequential(
     slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=False)
 
     rotation_matrices = []
+    hidden_states_collection = {} if save_hidden_states else None
+
+    # Save embedding inputs (layer 0 inputs)
+    if save_hidden_states:
+        hidden_states_collection["embedding_output"] = [inp.clone().cpu() for inp in inps]
+        logging.info("Saved embedding output hidden states")
 
     # rotate and slice embeddings
     eig_val, Q = pca_calc(inps, ignore_masks)
@@ -203,6 +219,11 @@ def rotate_and_slice_sequential(
             )
 
         mlp_ln_inputs, _ = get_signals(layer_adapter, args, kwargs)
+
+        # Save MLP LayerNorm inputs (post-attention hidden states)
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_attn_output"] = [h.clone().cpu() for h in mlp_ln_inputs]
+
         eig_val, Q = pca_calc(mlp_ln_inputs, ignore_masks)
         Q = Q.to(device=config.device, dtype=torch.float64)
         if final_orientation == 'random':
@@ -242,6 +263,11 @@ def rotate_and_slice_sequential(
         # now compute the outputs of the current layer/inputs for the next layer
         # with slicing between Attention and mlp.
         _, inps = get_signals(layer_adapter, args, kwargs)
+
+        # Save layer outputs (MLP outputs / next layer inputs)
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_mlp_output"] = [h.clone().cpu() for h in inps]
+
         eig_val, Q = pca_calc(inps, ignore_masks)
         if final_orientation == 'random':
             R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
@@ -276,7 +302,10 @@ def rotate_and_slice_sequential(
     model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
     logging.info("Rotate and slice layers done")
 
-    return rotation_matrices
+    if save_hidden_states:
+        logging.info(f"Collected hidden states for {len(hidden_states_collection)} positions")
+
+    return rotation_matrices, hidden_states_collection
 
 
 @torch.no_grad()
@@ -286,11 +315,16 @@ def rotate_and_slice_parallel(
     slicing_scheduler: SlicingScheduler,
     apply_mask: bool = True,
     final_orientation: str = 'pca',
-) -> list[dict]:
+    save_hidden_states: bool = False,
+) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
 
     This version works for models where the MLP block and the attention block are computed in parallel.
+
+    Returns:
+        rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
+        hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
     """
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
@@ -308,6 +342,12 @@ def rotate_and_slice_parallel(
     slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=True)
 
     rotation_matrices = []
+    hidden_states_collection = {} if save_hidden_states else None
+
+    # Save embedding inputs (layer 0 inputs)
+    if save_hidden_states:
+        hidden_states_collection["embedding_output"] = [inp.clone().cpu() for inp in inps]
+        logging.info("Saved embedding output hidden states")
 
     # rotate and slice embeddings
     eig_val, Q = pca_calc(inps, ignore_masks)
@@ -361,6 +401,11 @@ def rotate_and_slice_parallel(
             outputs.append(out)
 
         inps = outputs
+
+        # Save layer outputs (for parallel blocks, this is the combined attn+mlp output)
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_output"] = [h.clone().cpu() for h in inps]
+
         eig_val, Q = pca_calc(inps, ignore_masks)
 
         if final_orientation == 'random':
@@ -403,7 +448,10 @@ def rotate_and_slice_parallel(
     model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
     logging.info("Rotate and slice layers done")
 
-    return rotation_matrices
+    if save_hidden_states:
+        logging.info(f"Collected hidden states for {len(hidden_states_collection)} positions")
+
+    return rotation_matrices, hidden_states_collection
 
 
 @torch.no_grad()

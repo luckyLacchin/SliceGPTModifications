@@ -89,6 +89,11 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     )
 
     parser.add_argument("--save-dir", type=str, default=None, help="Path to save the model.")
+    parser.add_argument(
+        "--save-hidden-states",
+        action="store_true",
+        help="Save raw hidden states per layer for spectrum analysis (JS divergence, effective rank, etc.)",
+    )
 
     parser.add_argument('--hf-token', type=str, default=os.getenv('HF_TOKEN', None))
 
@@ -223,7 +228,13 @@ def slicing_main(args: argparse.Namespace) -> None:
 
     logging.info("Saving rotation matrices is enabled.")
     scheduler = ConstSlicingScheduler(new_embedding_dimension)
-    rotation_matrices = rotate.rotate_and_slice(model_adapter, train_loader, scheduler, final_orientation=args.final_orientation)
+    rotation_matrices, hidden_states = rotate.rotate_and_slice(
+        model_adapter,
+        train_loader,
+        scheduler,
+        final_orientation=args.final_orientation,
+        save_hidden_states=args.save_hidden_states,
+    )
 
     if args.save_dir:
         sliced_model_dir = pathlib.Path(args.save_dir)
@@ -236,6 +247,12 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         rotation_matrices_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}_rotation_matrices.pt"
         torch.save(rotation_matrices, rotation_matrices_file)
+
+        # Save hidden states for spectrum analysis if requested
+        if hidden_states is not None:
+            hidden_states_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}_{args.cal_dataset}_hidden_states.pt"
+            torch.save(hidden_states, hidden_states_file)
+            logging.info(f"Saved hidden states to {hidden_states_file}")
 
         # Save the slicing config
         config_path = sliced_model_name.with_suffix('.json')
