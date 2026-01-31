@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -13,6 +14,60 @@ from .model_adapter import LayerAdapter, ModelAdapter
 from .model_utils import get_layer0_inputs, get_signals
 from .slicing_scheduler import ConfigSlicingScheduler, ConstSlicingScheduler, SlicingScheduler
 from .utils import cleanup_memory, map_tensors
+
+
+@dataclass
+class AblationConfig:
+    """
+    Configuration for ablation experiments on SliceGPT.
+
+    Controls whether SliceGPT transformations are applied at:
+    - Position A: After attention, before MLP (attn_shortcut_Q)
+    - Position B: After MLP, before next layer (mlp_shortcut_Q)
+
+    Use cases:
+    - enable_position_a=True, enable_position_b=True: Normal SliceGPT (default)
+    - enable_position_a=False, enable_position_b=True: Only slice at MLP output
+    - enable_position_a=True, enable_position_b=False: Only slice at attention output
+    - enable_position_a=False, enable_position_b=False: No slicing (baseline)
+
+    Layer-specific control:
+    - Use `layers_position_a` and `layers_position_b` to specify which layers
+      should have each position enabled. If None, uses global enable flags.
+    """
+    # Global enable flags
+    enable_position_a: bool = True  # Attention output → MLP input
+    enable_position_b: bool = True  # MLP output → next layer
+
+    # Layer-specific control (overrides global flags if set)
+    # e.g., layers_position_a={0, 1, 2} means only enable position A for layers 0, 1, 2
+    layers_position_a: set[int] | None = None
+    layers_position_b: set[int] | None = None
+
+    def is_position_a_enabled(self, layer_idx: int) -> bool:
+        """Check if Position A is enabled for a specific layer."""
+        if self.layers_position_a is not None:
+            return layer_idx in self.layers_position_a
+        return self.enable_position_a
+
+    def is_position_b_enabled(self, layer_idx: int) -> bool:
+        """Check if Position B is enabled for a specific layer."""
+        if self.layers_position_b is not None:
+            return layer_idx in self.layers_position_b
+        return self.enable_position_b
+
+    def get_config_name(self) -> str:
+        """Get a descriptive name for this ablation configuration."""
+        if self.layers_position_a is not None or self.layers_position_b is not None:
+            return "layer_specific"
+        if self.enable_position_a and self.enable_position_b:
+            return "full"
+        elif self.enable_position_a and not self.enable_position_b:
+            return "position_a_only"
+        elif not self.enable_position_a and self.enable_position_b:
+            return "position_b_only"
+        else:
+            return "no_slicing"
 
 
 def rotate_attention_inputs(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
@@ -128,18 +183,39 @@ def rotate_and_slice(
     apply_mask: bool = True,
     final_orientation: str = 'pca',
     save_hidden_states: bool = False,
+    ablation_config: AblationConfig | None = None,
 ) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
 
+    Args:
+        model_adapter: The model adapter wrapping the model to be sliced
+        dataloader: DataLoader providing calibration data
+        slicing_scheduler: Scheduler controlling dimension reduction per layer
+        apply_mask: Whether to apply attention mask during PCA calculation
+        final_orientation: 'pca' or 'random' orientation for final basis
+        save_hidden_states: Whether to save hidden states for analysis
+        ablation_config: Configuration for ablation experiments (Position A/B control)
+            - None: Normal SliceGPT behavior (both positions enabled)
+            - AblationConfig: Fine-grained control over which positions are sliced
+
     Returns:
-        rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
-        hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
+        rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer (always computed)
+        hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True), else None
     """
+    if ablation_config is None:
+        ablation_config = AblationConfig()  # Default: both positions enabled
+
     if model_adapter.parallel_blocks:
-        return rotate_and_slice_parallel(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation, save_hidden_states)
+        return rotate_and_slice_parallel(
+            model_adapter, dataloader, slicing_scheduler, apply_mask,
+            final_orientation, save_hidden_states, ablation_config
+        )
     else:
-        return rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation, save_hidden_states)
+        return rotate_and_slice_sequential(
+            model_adapter, dataloader, slicing_scheduler, apply_mask,
+            final_orientation, save_hidden_states, ablation_config
+        )
 
 
 @torch.no_grad()
@@ -150,16 +226,31 @@ def rotate_and_slice_sequential(
     apply_mask: bool = True,
     final_orientation: str = 'pca',
     save_hidden_states: bool = False,
+    ablation_config: AblationConfig | None = None,
 ) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice the provided model, with interleaved slicing and PCA calculations.
 
     This method works for models where the MLP block is computed after the attention block.
 
+    Args:
+        model_adapter: The model adapter wrapping the model to be sliced
+        dataloader: DataLoader providing calibration data
+        slicing_scheduler: Scheduler controlling dimension reduction per layer
+        apply_mask: Whether to apply attention mask during PCA calculation
+        final_orientation: 'pca' or 'random' orientation for final basis
+        save_hidden_states: Whether to save hidden states for analysis
+        ablation_config: Configuration for ablation experiments
+            - Position A: Attention output → MLP input (attn_shortcut_Q)
+            - Position B: MLP output → next layer (mlp_shortcut_Q)
+
     Returns:
         rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
         hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
     """
+    if ablation_config is None:
+        ablation_config = AblationConfig()  # Default: both positions enabled
+
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
 
@@ -183,6 +274,11 @@ def rotate_and_slice_sequential(
         hidden_states_collection["embedding_output"] = [inp.clone().cpu() for inp in inps]
         logging.info("Saved embedding output hidden states")
 
+    # Log ablation configuration
+    logging.info(f"Ablation config: {ablation_config.get_config_name()}")
+    logging.info(f"  Position A (attn→mlp) enabled: {ablation_config.enable_position_a}")
+    logging.info(f"  Position B (mlp→next) enabled: {ablation_config.enable_position_b}")
+
     # rotate and slice embeddings
     eig_val, Q = pca_calc(inps, ignore_masks)
     Q = Q.to(device=config.device)
@@ -203,6 +299,11 @@ def rotate_and_slice_sequential(
     logging.info("Rotate and slice layers")
     for idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Rotating and slicing")):
         layer = layer_adapter.layer
+
+        # Check ablation flags for this layer
+        position_a_enabled = ablation_config.is_position_a_enabled(idx)
+        position_b_enabled = ablation_config.is_position_b_enabled(idx)
+
         layer.attn_shortcut_Q = nn.Parameter(Q.T.clone().to(dtype=dtype))
 
         # rotate and slice the attention inputs to match previous layer
@@ -224,38 +325,78 @@ def rotate_and_slice_sequential(
         if save_hidden_states:
             hidden_states_collection[f"layer_{idx}_attn_output"] = [h.clone().cpu() for h in mlp_ln_inputs]
 
-        eig_val, Q = pca_calc(mlp_ln_inputs, ignore_masks)
-        Q = Q.to(device=config.device, dtype=torch.float64)
-        if final_orientation == 'random':
-            R = random_orthogonal_upper_left(
-                Q.shape[0], slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+        # =====================================================================
+        # POSITION A: Attention output → MLP input transformation
+        # =====================================================================
+        if position_a_enabled:
+            # Normal SliceGPT: compute PCA and apply rotation/slicing
+            eig_val, Q_a = pca_calc(mlp_ln_inputs, ignore_masks)
+            Q_a = Q_a.to(device=config.device, dtype=torch.float64)
+            if final_orientation == 'random':
+                R = random_orthogonal_upper_left(
+                    Q_a.shape[0], slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+                )
+                Q_a = Q_a @ R.to(Q_a.device)
+
+            rotation_matrices.append({
+                "type": "attn_output",
+                "layer_type": "sequential",
+                "layer": idx,
+                "eigenvalues": eig_val.cpu(),
+                "eigenvectors": Q_a.cpu(),
+                "position_a_enabled": True,
+            })
+
+            layer.attn_shortcut_Q = nn.Parameter(
+                torch.matmul(
+                    layer.attn_shortcut_Q,
+                    Q_a.to(dtype=dtype)[:, : slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)],
+                )
             )
-            Q = Q @ R.to(Q.device)
-
-        rotation_matrices.append({
-            "type": "attn_output",
-            "layer_type": "sequential",
-            "layer": idx,
-            "eigenvalues": eig_val.cpu(),
-            "eigenvectors": Q.cpu(),
-        })
-
-        layer.attn_shortcut_Q = nn.Parameter(
-            torch.matmul(
-                layer.attn_shortcut_Q,
-                Q.to(dtype=dtype)[:, : slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)],
+            rotate_attention_output(layer_adapter, Q_a)
+            slice_attention_output(
+                layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
             )
-        )
-        rotate_attention_output(layer_adapter, Q)
-        slice_attention_output(
-            layer_adapter, slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
-        )
 
-        layer.mlp_shortcut_Q = nn.Parameter(
-            Q.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
-        )
-        rotate_mlp_input(layer_adapter, Q)
-        slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(idx))
+            layer.mlp_shortcut_Q = nn.Parameter(
+                Q_a.T.clone().to(dtype=dtype)[: slicing_scheduler.get_mlp_input_dimension(idx), :]
+            )
+            rotate_mlp_input(layer_adapter, Q_a)
+            slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(idx))
+        else:
+            # ABLATION: Position A disabled - use identity transformation (no PCA rotation here)
+            # Still need to record what PCA *would have been* for analysis
+            eig_val, Q_a = pca_calc(mlp_ln_inputs, ignore_masks)
+            Q_a = Q_a.to(device=config.device, dtype=torch.float64)
+
+            rotation_matrices.append({
+                "type": "attn_output",
+                "layer_type": "sequential",
+                "layer": idx,
+                "eigenvalues": eig_val.cpu(),
+                "eigenvectors": Q_a.cpu(),
+                "position_a_enabled": False,  # Mark as disabled for analysis
+            })
+
+            # Use identity: no rotation at Position A
+            # The hidden size stays the same, no slicing at this position
+            hidden_size = mlp_ln_inputs[0].shape[-1]
+            I = torch.eye(hidden_size, device=config.device, dtype=torch.float64)
+
+            layer.attn_shortcut_Q = nn.Parameter(
+                torch.matmul(
+                    layer.attn_shortcut_Q,
+                    I.to(dtype=dtype),
+                )
+            )
+            # No rotation on attention output (identity)
+            # No slicing on attention output (keep full dimension)
+
+            layer.mlp_shortcut_Q = nn.Parameter(
+                I.T.clone().to(dtype=dtype)
+            )
+            # No rotation on MLP input (identity)
+            # No slicing on MLP input (keep full dimension)
 
         # Run GC and cleanup GPU memory
         cleanup_memory()
@@ -268,25 +409,61 @@ def rotate_and_slice_sequential(
         if save_hidden_states:
             hidden_states_collection[f"layer_{idx}_mlp_output"] = [h.clone().cpu() for h in inps]
 
-        eig_val, Q = pca_calc(inps, ignore_masks)
-        if final_orientation == 'random':
-            R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
-            Q = Q @ R.to(Q.device)
+        # =====================================================================
+        # POSITION B: MLP output → next layer transformation
+        # =====================================================================
+        if position_b_enabled:
+            # Normal SliceGPT: compute PCA and apply rotation/slicing
+            eig_val, Q_b = pca_calc(inps, ignore_masks)
+            Q_b = Q_b.to(device=config.device, dtype=torch.float64)
+            if final_orientation == 'random':
+                R = random_orthogonal_upper_left(Q_b.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
+                Q_b = Q_b @ R.to(Q_b.device)
 
-        rotation_matrices.append({
-            "type": "mlp_output",
-            "layer_type": "sequential",
-            "layer": idx,
-            "eigenvalues": eig_val.cpu(),
-            "eigenvectors": Q.cpu(),
-        })
+            rotation_matrices.append({
+                "type": "mlp_output",
+                "layer_type": "sequential",
+                "layer": idx,
+                "eigenvalues": eig_val.cpu(),
+                "eigenvectors": Q_b.cpu(),
+                "position_b_enabled": True,
+            })
 
-        layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q.to(dtype=dtype)))
+            layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q_b.to(dtype=dtype)))
 
-        # optionally slice the mlp/head connection in the last layer
-        rotate_mlp_output(layer_adapter, Q)
-        slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
-        layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(idx)])
+            # optionally slice the mlp/head connection in the last layer
+            rotate_mlp_output(layer_adapter, Q_b)
+            slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
+            layer.mlp_shortcut_Q = nn.Parameter(layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(idx)])
+
+            # Q for next layer
+            Q = Q_b
+        else:
+            # ABLATION: Position B disabled - use identity transformation
+            # Still need to record what PCA *would have been* for analysis
+            eig_val, Q_b = pca_calc(inps, ignore_masks)
+            Q_b = Q_b.to(device=config.device, dtype=torch.float64)
+
+            rotation_matrices.append({
+                "type": "mlp_output",
+                "layer_type": "sequential",
+                "layer": idx,
+                "eigenvalues": eig_val.cpu(),
+                "eigenvectors": Q_b.cpu(),
+                "position_b_enabled": False,  # Mark as disabled for analysis
+            })
+
+            # Use identity: no rotation at Position B
+            hidden_size = inps[0].shape[-1]
+            I = torch.eye(hidden_size, device=config.device, dtype=torch.float64)
+
+            layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, I.to(dtype=dtype)))
+
+            # No rotation on MLP output (identity)
+            # No slicing on MLP output (keep full dimension)
+
+            # Q for next layer is identity
+            Q = I
 
         layer.to('cpu')
 
@@ -316,16 +493,26 @@ def rotate_and_slice_parallel(
     apply_mask: bool = True,
     final_orientation: str = 'pca',
     save_hidden_states: bool = False,
+    ablation_config: AblationConfig | None = None,
 ) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
 
     This version works for models where the MLP block and the attention block are computed in parallel.
 
+    Note: For parallel blocks, ablation is more limited since attention and MLP share the same
+    residual connection. The ablation_config is accepted for API consistency but Position A/B
+    distinction doesn't apply in the same way as sequential models.
+
     Returns:
         rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer
         hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True)
     """
+    if ablation_config is not None and (not ablation_config.enable_position_a or not ablation_config.enable_position_b):
+        logging.warning(
+            "Ablation config provided for parallel model. Position A/B distinction is limited "
+            "for parallel blocks since attention and MLP share the same residual connection."
+        )
     model_adapter.model.eval()
     dtype = next(iter(model_adapter.model.parameters())).dtype
 

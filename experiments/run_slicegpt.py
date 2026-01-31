@@ -12,7 +12,19 @@ import wandb
 
 from slicegpt import data_utils, gpu_utils, hf_utils, layernorm_fusion, rotate, utils
 from slicegpt.config import config
+from slicegpt.rotate import AblationConfig
 from slicegpt.slicing_scheduler import ConstSlicingScheduler
+
+
+def get_ablation_config(config_name: str) -> AblationConfig:
+    """Create AblationConfig from config name string."""
+    configs = {
+        "full": AblationConfig(enable_position_a=True, enable_position_b=True),
+        "position_a_only": AblationConfig(enable_position_a=True, enable_position_b=False),
+        "position_b_only": AblationConfig(enable_position_a=False, enable_position_b=True),
+        "no_slicing": AblationConfig(enable_position_a=False, enable_position_b=False),
+    }
+    return configs[config_name]
 
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
@@ -94,6 +106,11 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         action="store_true",
         help="Save raw hidden states per layer for spectrum analysis (JS divergence, effective rank, etc.)",
     )
+    parser.add_argument(
+        "--save-rotation-matrices",
+        action="store_true",
+        help="Save rotation matrices (eigenvalues and eigenvectors) per layer for PCA analysis.",
+    )
 
     parser.add_argument('--hf-token', type=str, default=os.getenv('HF_TOKEN', None))
 
@@ -104,6 +121,15 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         type=str,
         default=None,
         help="PyTorch device to use. Example values are 'cpu', 'cuda', 'cuda:0'. If not specified it will be defaulted to 'cuda' if available and 'cpu' otherwise.",
+    )
+
+    # Ablation experiment arguments
+    parser.add_argument(
+        '--ablation-config',
+        type=str,
+        default="full",
+        choices=["full", "position_a_only", "position_b_only", "no_slicing"],
+        help="Ablation configuration: 'full' (both positions), 'position_a_only' (attention→MLP), 'position_b_only' (MLP→next), 'no_slicing' (baseline)",
     )
 
     return parser.parse_args() if interactive else parser.parse_args('')
@@ -226,31 +252,41 @@ def slicing_main(args: argparse.Namespace) -> None:
         f"New embedding dimension: {new_embedding_dimension} (sparsity {100*(1 - new_embedding_dimension / model_adapter.hidden_size):.4f} %)"
     )
 
-    logging.info("Saving rotation matrices is enabled.")
     scheduler = ConstSlicingScheduler(new_embedding_dimension)
+
+    # Create ablation config
+    ablation_config = get_ablation_config(args.ablation_config)
+    logging.info(f"Ablation config: {args.ablation_config}")
+
     rotation_matrices, hidden_states = rotate.rotate_and_slice(
         model_adapter,
         train_loader,
         scheduler,
         final_orientation=args.final_orientation,
         save_hidden_states=args.save_hidden_states,
+        ablation_config=ablation_config,
     )
 
     if args.save_dir:
         sliced_model_dir = pathlib.Path(args.save_dir)
         sliced_model_dir.mkdir(parents=True, exist_ok=True)
 
-        sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}.pt'
+        # Include ablation config in filenames
+        ablation_suffix = f"_{args.ablation_config}" if args.ablation_config != "full" else ""
+        sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}{ablation_suffix}.pt'
 
         # Save the sliced model
         torch.save(model.state_dict(), sliced_model_name)
 
-        rotation_matrices_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}_rotation_matrices.pt"
-        torch.save(rotation_matrices, rotation_matrices_file)
+        # Save rotation matrices if requested
+        if args.save_rotation_matrices:
+            rotation_matrices_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}{ablation_suffix}_rotation_matrices.pt"
+            torch.save(rotation_matrices, rotation_matrices_file)
+            logging.info(f"Saved rotation matrices to {rotation_matrices_file}")
 
         # Save hidden states for spectrum analysis if requested
         if hidden_states is not None:
-            hidden_states_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}_{args.cal_dataset}_hidden_states.pt"
+            hidden_states_file = sliced_model_dir / f"{pathlib.Path(args.model).name}_{args.sparsity}_{args.cal_dataset}{ablation_suffix}_hidden_states.pt"
             torch.save(hidden_states, hidden_states_file)
             logging.info(f"Saved hidden states to {hidden_states_file}")
 
