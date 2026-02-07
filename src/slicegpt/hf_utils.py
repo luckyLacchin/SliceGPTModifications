@@ -131,9 +131,18 @@ def load_sliced_model(
     my_sliced_model_name = f"{my_model_suffix}_{sparsity}.pt"
     my_sliced_model_config = f"{my_model_suffix}_{sparsity}.json"
 
+    sliced_path = pathlib.Path(sliced_model_path)
+    is_file_path = sliced_path.is_file() or sliced_path.suffix == ".pt"
+    if is_file_path:
+        weights_path = sliced_path
+        sliced_dir = sliced_path.parent
+    else:
+        weights_path = sliced_path / my_sliced_model_name
+        sliced_dir = sliced_path
+
     model_adapter, tokenizer = get_model_and_tokenizer(
         model_name,
-        model_path=sliced_model_path,
+        model_path=str(sliced_dir),
         uninitialized=True,
         token=token,
     )
@@ -150,7 +159,7 @@ def load_sliced_model(
             torch.zeros(hidden_size, hidden_size).to(dtype=torch.float16)
         )
 
-    config_path = pathlib.Path(sliced_model_path) / my_sliced_model_config
+    config_path = sliced_dir / my_sliced_model_config
 
     if config_path.exists():
         model_adapter.slicing_conf = SlicingConfig.from_json_string(config_path.read_text())
@@ -170,9 +179,9 @@ def load_sliced_model(
 
         model_adapter.model = get_peft_model(model_adapter.model, lora_config)
 
-    logging.info(f"Loading sliced model weights from {sliced_model_path}")
+    logging.info(f"Loading sliced model weights from {weights_path}")
     model_adapter.model.load_state_dict(
-        torch.load(str(pathlib.Path(sliced_model_path) / my_sliced_model_name), map_location="cpu")
+        torch.load(str(weights_path), map_location="cpu")
     )
     model_adapter.model.eval()
 

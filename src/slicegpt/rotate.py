@@ -70,6 +70,56 @@ class AblationConfig:
             return "no_slicing"
 
 
+@dataclass
+class ProjectionConfig:
+    """
+    Configuration for projection-only experiments on SliceGPT.
+
+    In projection-only mode, we do not slice residual dimensions.
+    We only apply top-k PCA projectors inside selected sub-modules.
+    """
+    projection_only: bool = False
+    project_attention: bool = True
+    project_mlp: bool = True
+    layers_project_attention: set[int] | None = None
+    layers_project_mlp: set[int] | None = None
+
+    def get_config_name(self) -> str:
+        """Get a descriptive name for this projection configuration."""
+        if self.layers_project_attention is not None or self.layers_project_mlp is not None:
+            return "projection_layer_specific"
+        if self.project_attention and self.project_mlp:
+            return "projection_full"
+        if self.project_attention and not self.project_mlp:
+            return "projection_attention_only"
+        if not self.project_attention and self.project_mlp:
+            return "projection_mlp_only"
+        return "projection_disabled"
+
+    def is_attention_projection_enabled(self, layer_idx: int) -> bool:
+        """Check if attention projection is enabled for a specific layer."""
+        if self.layers_project_attention is not None:
+            return layer_idx in self.layers_project_attention
+        return self.project_attention
+
+    def is_mlp_projection_enabled(self, layer_idx: int) -> bool:
+        """Check if MLP projection is enabled for a specific layer."""
+        if self.layers_project_mlp is not None:
+            return layer_idx in self.layers_project_mlp
+        return self.project_mlp
+
+
+def _build_topk_projector(Q: torch.Tensor, rank: int) -> tuple[torch.Tensor, int]:
+    """
+    Build projector P_k = Q_k Q_k^T from an orthonormal basis Q.
+    Returns the projector and the clamped rank.
+    """
+    hidden_size = Q.shape[0]
+    clamped_rank = max(1, min(rank, hidden_size))
+    Q_k = Q[:, :clamped_rank]
+    return Q_k @ Q_k.T, clamped_rank
+
+
 def rotate_attention_inputs(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
     # Rotate the WQ, WK and WV matrices of the self-attention layer.
     for W in layer_adapter.get_attention_inputs():
@@ -184,6 +234,7 @@ def rotate_and_slice(
     final_orientation: str = 'pca',
     save_hidden_states: bool = False,
     ablation_config: AblationConfig | None = None,
+    projection_config: ProjectionConfig | None = None,
 ) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
     """
     Rotate and slice a model, with interleaved slicing and PCA calculations
@@ -198,6 +249,9 @@ def rotate_and_slice(
         ablation_config: Configuration for ablation experiments (Position A/B control)
             - None: Normal SliceGPT behavior (both positions enabled)
             - AblationConfig: Fine-grained control over which positions are sliced
+        projection_config: Configuration for projection-only experiments
+            - None: Projection-only mode disabled
+            - ProjectionConfig: Controls projection-only execution and module toggles
 
     Returns:
         rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer (always computed)
@@ -205,6 +259,20 @@ def rotate_and_slice(
     """
     if ablation_config is None:
         ablation_config = AblationConfig()  # Default: both positions enabled
+
+    if projection_config is None:
+        projection_config = ProjectionConfig()
+
+    if projection_config.projection_only:
+        if final_orientation != "pca":
+            logging.warning("final_orientation is ignored in projection-only mode.")
+        if model_adapter.parallel_blocks:
+            return rotate_and_project_parallel(
+                model_adapter, dataloader, slicing_scheduler, apply_mask, save_hidden_states, projection_config
+            )
+        return rotate_and_project_sequential(
+            model_adapter, dataloader, slicing_scheduler, apply_mask, save_hidden_states, projection_config
+        )
 
     if model_adapter.parallel_blocks:
         return rotate_and_slice_parallel(
@@ -216,6 +284,241 @@ def rotate_and_slice(
             model_adapter, dataloader, slicing_scheduler, apply_mask,
             final_orientation, save_hidden_states, ablation_config
         )
+
+
+@torch.no_grad()
+def rotate_and_project_sequential(
+    model_adapter: ModelAdapter,
+    dataloader: torch.utils.data.DataLoader[torch.Tensor],
+    slicing_scheduler: SlicingScheduler,
+    apply_mask: bool = True,
+    save_hidden_states: bool = False,
+    projection_config: ProjectionConfig | None = None,
+) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
+    """
+    Projection-only ablation for sequential blocks.
+
+    This keeps residual width equal to hidden size. No slicing is applied.
+    Instead, top-k PCA projectors are applied inside attention and/or MLP.
+    """
+    if projection_config is None:
+        projection_config = ProjectionConfig(projection_only=True)
+
+    model_adapter.model.eval()
+
+    inps, args, kwargs, ignore_masks = [], [], [], []
+    for batch in dataloader:
+        inp_batch, args_batch, kwargs_batch = get_layer0_inputs(model_adapter, batch)
+        inps.append(inp_batch)
+        args.append(args_batch)
+        kwargs.append(kwargs_batch)
+        if apply_mask:
+            ignore_masks.append(batch["attention_mask"])
+
+    layers = model_adapter.get_layers()
+    slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=False)
+
+    rotation_matrices = []
+    hidden_states_collection = {} if save_hidden_states else None
+
+    if save_hidden_states:
+        hidden_states_collection["embedding_output"] = [inp.clone().cpu() for inp in inps]
+        logging.info("Saved embedding output hidden states")
+
+    logging.info(f"Projection config: {projection_config.get_config_name()}")
+    logging.info("Projection-only mode enabled (no slicing, no embedding/head rotation)")
+    logging.info(f"  Attention projection enabled: {projection_config.project_attention}")
+    logging.info(f"  MLP projection enabled: {projection_config.project_mlp}")
+
+    for idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Projecting sub-modules")):
+        layer = layer_adapter.layer
+        if hasattr(layer, "attn_shortcut_Q"):
+            layer.attn_shortcut_Q = None
+        if hasattr(layer, "mlp_shortcut_Q"):
+            layer.mlp_shortcut_Q = None
+
+        attention_projection_enabled = projection_config.is_attention_projection_enabled(idx)
+        mlp_projection_enabled = projection_config.is_mlp_projection_enabled(idx)
+
+        eig_val_attn, Q_attn = pca_calc(inps, ignore_masks)
+        Q_attn = Q_attn.to(device=config.device, dtype=torch.float64)
+        attn_rank = slicing_scheduler.get_attention_input_dimension(idx)
+        P_attn, attn_rank = _build_topk_projector(Q_attn, attn_rank)
+
+        rotation_matrices.append({
+            "type": "attention_projector",
+            "layer_type": "sequential",
+            "layer": idx,
+            "rank": attn_rank,
+            "enabled": attention_projection_enabled,
+            "eigenvalues": eig_val_attn.cpu(),
+            "eigenvectors": Q_attn.cpu(),
+            "projector": P_attn.cpu(),
+        })
+
+        if attention_projection_enabled:
+            rotate_attention_inputs(layer_adapter, P_attn)
+            rotate_attention_output(layer_adapter, P_attn)
+
+        for i, inp in enumerate(inps):
+            args[i] = layer_adapter.get_updated_args(inp, args[i])
+        mlp_ln_inputs, _ = get_signals(layer_adapter, args, kwargs)
+
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_attn_output"] = [h.clone().cpu() for h in mlp_ln_inputs]
+
+        eig_val_mlp, Q_mlp = pca_calc(mlp_ln_inputs, ignore_masks)
+        Q_mlp = Q_mlp.to(device=config.device, dtype=torch.float64)
+        mlp_rank = slicing_scheduler.get_mlp_input_dimension(idx)
+        P_mlp, mlp_rank = _build_topk_projector(Q_mlp, mlp_rank)
+
+        rotation_matrices.append({
+            "type": "mlp_projector",
+            "layer_type": "sequential",
+            "layer": idx,
+            "rank": mlp_rank,
+            "enabled": mlp_projection_enabled,
+            "eigenvalues": eig_val_mlp.cpu(),
+            "eigenvectors": Q_mlp.cpu(),
+            "projector": P_mlp.cpu(),
+        })
+
+        if mlp_projection_enabled:
+            rotate_mlp_input(layer_adapter, P_mlp)
+            rotate_mlp_output(layer_adapter, P_mlp)
+
+        for i, inp in enumerate(inps):
+            args[i] = layer_adapter.get_updated_args(inp, args[i])
+        _, inps = get_signals(layer_adapter, args, kwargs)
+
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_mlp_output"] = [h.clone().cpu() for h in inps]
+
+        layer.to("cpu")
+        cleanup_memory()
+
+    if save_hidden_states:
+        logging.info(f"Collected hidden states for {len(hidden_states_collection)} positions")
+
+    return rotation_matrices, hidden_states_collection
+
+
+@torch.no_grad()
+def rotate_and_project_parallel(
+    model_adapter: ModelAdapter,
+    dataloader: torch.utils.data.DataLoader[torch.Tensor],
+    slicing_scheduler: SlicingScheduler,
+    apply_mask: bool = True,
+    save_hidden_states: bool = False,
+    projection_config: ProjectionConfig | None = None,
+) -> tuple[list[dict], dict[str, list[torch.Tensor]] | None]:
+    """
+    Projection-only ablation for parallel blocks.
+
+    This keeps residual width equal to hidden size and applies no slicing.
+    """
+    if projection_config is None:
+        projection_config = ProjectionConfig(projection_only=True)
+
+    model_adapter.model.eval()
+
+    inps, args, kwargs, ignore_masks = [], [], [], []
+    for batch in dataloader:
+        inp_batch, args_batch, kwargs_batch = get_layer0_inputs(model_adapter, batch)
+        inps.append(inp_batch)
+        args.append(args_batch)
+        kwargs.append(kwargs_batch)
+        if apply_mask:
+            ignore_masks.append(batch["attention_mask"])
+
+    layers = model_adapter.get_layers()
+    slicing_scheduler.setup(hidden_size=model_adapter.hidden_size, layers_num=len(layers), parallel_blocks=True)
+
+    rotation_matrices = []
+    hidden_states_collection = {} if save_hidden_states else None
+
+    if save_hidden_states:
+        hidden_states_collection["embedding_output"] = [inp.clone().cpu() for inp in inps]
+        logging.info("Saved embedding output hidden states")
+
+    logging.info(f"Projection config: {projection_config.get_config_name()}")
+    logging.info("Projection-only mode enabled (parallel blocks, no slicing)")
+    logging.info(f"  Attention projection enabled: {projection_config.project_attention}")
+    logging.info(f"  MLP projection enabled: {projection_config.project_mlp}")
+
+    for idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Projecting sub-modules")):
+        layer = layer_adapter.layer
+        if hasattr(layer, "attn_shortcut_Q"):
+            layer.attn_shortcut_Q = None
+        if hasattr(layer, "mlp_shortcut_Q"):
+            layer.mlp_shortcut_Q = None
+
+        attention_projection_enabled = projection_config.is_attention_projection_enabled(idx)
+        mlp_projection_enabled = projection_config.is_mlp_projection_enabled(idx)
+
+        eig_val, Q = pca_calc(inps, ignore_masks)
+        Q = Q.to(device=config.device, dtype=torch.float64)
+
+        attn_rank = slicing_scheduler.get_attention_input_dimension(idx)
+        P_attn, attn_rank = _build_topk_projector(Q, attn_rank)
+        rotation_matrices.append({
+            "type": "attention_projector",
+            "layer_type": "parallel",
+            "layer": idx,
+            "rank": attn_rank,
+            "enabled": attention_projection_enabled,
+            "eigenvalues": eig_val.cpu(),
+            "eigenvectors": Q.cpu(),
+            "projector": P_attn.cpu(),
+        })
+
+        mlp_rank = slicing_scheduler.get_mlp_input_dimension(idx)
+        P_mlp, mlp_rank = _build_topk_projector(Q, mlp_rank)
+        rotation_matrices.append({
+            "type": "mlp_projector",
+            "layer_type": "parallel",
+            "layer": idx,
+            "rank": mlp_rank,
+            "enabled": mlp_projection_enabled,
+            "eigenvalues": eig_val.cpu(),
+            "eigenvectors": Q.cpu(),
+            "projector": P_mlp.cpu(),
+        })
+
+        if attention_projection_enabled:
+            rotate_attention_inputs(layer_adapter, P_attn)
+            rotate_attention_output(layer_adapter, P_attn)
+
+        if mlp_projection_enabled:
+            rotate_mlp_input(layer_adapter, P_mlp)
+            rotate_mlp_output(layer_adapter, P_mlp)
+
+        for i, inp in enumerate(inps):
+            args[i] = layer_adapter.get_updated_args(inp, args[i])
+
+        outputs = []
+        layer = layer.to(config.device)
+        for layer_args_batch, layer_kwargs_batch in zip(args, kwargs):
+            layer_args_batch, layer_kwargs_batch = map_tensors(
+                [layer_args_batch, layer_kwargs_batch], device=config.device
+            )
+            out = layer(*layer_args_batch, **layer_kwargs_batch)
+            if isinstance(out, tuple):
+                out = out[layer_adapter.hidden_states_output_position]
+            outputs.append(out.cpu())
+
+        inps = outputs
+
+        if save_hidden_states:
+            hidden_states_collection[f"layer_{idx}_output"] = [h.clone().cpu() for h in inps]
+
+        layer.to("cpu")
+        cleanup_memory()
+
+    if save_hidden_states:
+        logging.info(f"Collected hidden states for {len(hidden_states_collection)} positions")
+
+    return rotation_matrices, hidden_states_collection
 
 
 @torch.no_grad()
@@ -363,6 +666,7 @@ def rotate_and_slice_sequential(
             )
             rotate_mlp_input(layer_adapter, Q_a)
             slice_mlp_input(layer_adapter, slicing_scheduler.get_mlp_input_dimension(idx))
+            Q_a_for_layer = Q_a
         else:
             # ABLATION: Position A disabled - use identity transformation (no PCA rotation here)
             # Still need to record what PCA *would have been* for analysis
@@ -378,25 +682,29 @@ def rotate_and_slice_sequential(
                 "position_a_enabled": False,  # Mark as disabled for analysis
             })
 
-            # Use identity: no rotation at Position A
-            # The hidden size stays the same, no slicing at this position
+            # Use identity: no rotation at Position A, but still slice to keep dimensions consistent
             hidden_size = mlp_ln_inputs[0].shape[-1]
             I = torch.eye(hidden_size, device=config.device, dtype=torch.float64)
+            attn_out_dim = slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+            mlp_in_dim = slicing_scheduler.get_mlp_input_dimension(idx)
 
             layer.attn_shortcut_Q = nn.Parameter(
                 torch.matmul(
                     layer.attn_shortcut_Q,
-                    I.to(dtype=dtype),
+                    I.to(dtype=dtype)[:, :attn_out_dim],
                 )
             )
-            # No rotation on attention output (identity)
-            # No slicing on attention output (keep full dimension)
+            # No rotation on attention output (identity), but slice to scheduled width
+            slice_attention_output(
+                layer_adapter, attn_out_dim
+            )
 
             layer.mlp_shortcut_Q = nn.Parameter(
-                I.T.clone().to(dtype=dtype)
+                I.T.clone().to(dtype=dtype)[:mlp_in_dim, :]
             )
-            # No rotation on MLP input (identity)
-            # No slicing on MLP input (keep full dimension)
+            # No rotation on MLP input (identity), but slice to scheduled width
+            slice_mlp_input(layer_adapter, mlp_in_dim)
+            Q_a_for_layer = None
 
         # Run GC and cleanup GPU memory
         cleanup_memory()
@@ -453,17 +761,32 @@ def rotate_and_slice_sequential(
                 "position_b_enabled": False,  # Mark as disabled for analysis
             })
 
-            # Use identity: no rotation at Position B
-            hidden_size = inps[0].shape[-1]
-            I = torch.eye(hidden_size, device=config.device, dtype=torch.float64)
+            if position_a_enabled and Q_a_for_layer is not None:
+                # Reuse Position A PCA basis to keep dimensions consistent
+                layer.mlp_shortcut_Q = nn.Parameter(
+                    torch.matmul(layer.mlp_shortcut_Q, Q_a_for_layer.to(dtype=dtype))
+                )
 
-            layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, I.to(dtype=dtype)))
+                rotate_mlp_output(layer_adapter, Q_a_for_layer)
+                slice_mlp_output(layer_adapter, slicing_scheduler.get_mlp_output_dimension(idx))
+                layer.mlp_shortcut_Q = nn.Parameter(
+                    layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(idx)]
+                )
 
-            # No rotation on MLP output (identity)
-            # No slicing on MLP output (keep full dimension)
+                # Q for next layer follows Position A basis
+                Q = Q_a_for_layer
+            else:
+                # Use identity: no rotation at Position B
+                hidden_size = inps[0].shape[-1]
+                I = torch.eye(hidden_size, device=config.device, dtype=torch.float64)
 
-            # Q for next layer is identity
-            Q = I
+                layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, I.to(dtype=dtype)))
+
+                # No rotation on MLP output (identity)
+                # No slicing on MLP output (keep full dimension)
+
+                # Q for next layer is identity
+                Q = I
 
         layer.to('cpu')
 

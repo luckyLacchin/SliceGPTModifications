@@ -12,12 +12,14 @@ import wandb
 
 from slicegpt import data_utils, gpu_utils, hf_utils, layernorm_fusion, rotate, utils
 from slicegpt.config import config
-from slicegpt.rotate import AblationConfig
+from slicegpt.rotate import AblationConfig, ProjectionConfig
 from slicegpt.slicing_scheduler import ConstSlicingScheduler
 
 
-def get_ablation_config(config_name: str) -> AblationConfig:
-    """Create AblationConfig from config name string."""
+def get_ablation_config(
+    config_name: str
+) -> AblationConfig:
+    """Create AblationConfig from CLI options."""
     configs = {
         "full": AblationConfig(enable_position_a=True, enable_position_b=True),
         "position_a_only": AblationConfig(enable_position_a=True, enable_position_b=False),
@@ -25,6 +27,19 @@ def get_ablation_config(config_name: str) -> AblationConfig:
         "no_slicing": AblationConfig(enable_position_a=False, enable_position_b=False),
     }
     return configs[config_name]
+
+
+def get_projection_config(
+    projection_only: bool = False,
+    project_attention: bool = True,
+    project_mlp: bool = True,
+) -> ProjectionConfig:
+    """Create ProjectionConfig from CLI options."""
+    return ProjectionConfig(
+        projection_only=projection_only,
+        project_attention=project_attention,
+        project_mlp=project_mlp,
+    )
 
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
@@ -132,6 +147,37 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         help="Ablation configuration: 'full' (both positions), 'position_a_only' (attention→MLP), 'position_b_only' (MLP→next), 'no_slicing' (baseline)",
     )
 
+    parser.add_argument(
+        "--projection-only",
+        action="store_true",
+        help="Projection-only mode: do not slice dimensions; only apply top-k PCA projectors inside attention/MLP.",
+    )
+    parser.add_argument(
+        "--project-attention",
+        dest="project_attention",
+        action="store_true",
+        help="In projection-only mode, apply projector to attention sub-modules.",
+    )
+    parser.add_argument(
+        "--no-project-attention",
+        dest="project_attention",
+        action="store_false",
+        help="In projection-only mode, disable projector on attention sub-modules.",
+    )
+    parser.add_argument(
+        "--project-mlp",
+        dest="project_mlp",
+        action="store_true",
+        help="In projection-only mode, apply projector to MLP sub-modules.",
+    )
+    parser.add_argument(
+        "--no-project-mlp",
+        dest="project_mlp",
+        action="store_false",
+        help="In projection-only mode, disable projector on MLP sub-modules.",
+    )
+    parser.set_defaults(project_attention=True, project_mlp=True)
+
     return parser.parse_args() if interactive else parser.parse_args('')
 
 
@@ -151,6 +197,16 @@ def process_slicing_args(args):
         config.dtype = torch.float32
     else:
         raise argparse.ArgumentTypeError(f"Data type should be one of 'fp16', 'fp32'")
+
+    if not args.projection_only and (not args.project_attention or not args.project_mlp):
+        raise argparse.ArgumentTypeError(
+            "--no-project-attention/--no-project-mlp can only be used together with --projection-only"
+        )
+
+    if args.projection_only and (not args.project_attention and not args.project_mlp):
+        raise argparse.ArgumentTypeError(
+            "--projection-only requires at least one active projector: attention and/or mlp"
+        )
 
 
 def slicing_main(args: argparse.Namespace) -> None:
@@ -254,9 +310,16 @@ def slicing_main(args: argparse.Namespace) -> None:
 
     scheduler = ConstSlicingScheduler(new_embedding_dimension)
 
-    # Create ablation config
+    # Create configs
     ablation_config = get_ablation_config(args.ablation_config)
-    logging.info(f"Ablation config: {args.ablation_config}")
+    projection_config = get_projection_config(
+        projection_only=args.projection_only,
+        project_attention=args.project_attention,
+        project_mlp=args.project_mlp,
+    )
+    config_name = projection_config.get_config_name() if projection_config.projection_only else ablation_config.get_config_name()
+    logging.info(f"Ablation config: {ablation_config.get_config_name()}")
+    logging.info(f"Projection config: {projection_config.get_config_name()} (enabled={projection_config.projection_only})")
 
     rotation_matrices, hidden_states = rotate.rotate_and_slice(
         model_adapter,
@@ -265,6 +328,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         final_orientation=args.final_orientation,
         save_hidden_states=args.save_hidden_states,
         ablation_config=ablation_config,
+        projection_config=projection_config,
     )
 
     if args.save_dir:
@@ -272,7 +336,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         sliced_model_dir.mkdir(parents=True, exist_ok=True)
 
         # Include ablation config in filenames
-        ablation_suffix = f"_{args.ablation_config}" if args.ablation_config != "full" else ""
+        ablation_suffix = f"_{config_name}" if config_name != "full" else ""
         sliced_model_name = sliced_model_dir / f'{pathlib.Path(args.model).name}_{args.sparsity}{ablation_suffix}.pt'
 
         # Save the sliced model
