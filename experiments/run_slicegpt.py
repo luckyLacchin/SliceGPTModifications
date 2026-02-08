@@ -150,31 +150,34 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument(
         "--projection-only",
         action="store_true",
-        help="Projection-only mode: do not slice dimensions; only apply top-k PCA projectors inside attention/MLP.",
+        help=(
+            "Projection-only mode: do not slice dimensions; apply top-k PCA projectors to activations "
+            "around attention/MLP sub-modules."
+        ),
     )
     parser.add_argument(
         "--project-attention",
         dest="project_attention",
         action="store_true",
-        help="In projection-only mode, apply projector to attention sub-modules.",
+        help="In projection-only mode, apply activation projector around attention sub-modules.",
     )
     parser.add_argument(
         "--no-project-attention",
         dest="project_attention",
         action="store_false",
-        help="In projection-only mode, disable projector on attention sub-modules.",
+        help="In projection-only mode, disable activation projector on attention sub-modules.",
     )
     parser.add_argument(
         "--project-mlp",
         dest="project_mlp",
         action="store_true",
-        help="In projection-only mode, apply projector to MLP sub-modules.",
+        help="In projection-only mode, apply activation projector around MLP sub-modules.",
     )
     parser.add_argument(
         "--no-project-mlp",
         dest="project_mlp",
         action="store_false",
-        help="In projection-only mode, disable projector on MLP sub-modules.",
+        help="In projection-only mode, disable activation projector on MLP sub-modules.",
     )
     parser.set_defaults(project_attention=True, project_mlp=True)
 
@@ -330,6 +333,12 @@ def slicing_main(args: argparse.Namespace) -> None:
         ablation_config=ablation_config,
         projection_config=projection_config,
     )
+
+    if args.projection_only and args.save_dir:
+        logging.warning(
+            "Projection-only uses runtime activation hooks. "
+            "Model state_dict files do not serialize hook behavior; save rotation matrices to preserve projectors."
+        )
 
     if args.save_dir:
         sliced_model_dir = pathlib.Path(args.save_dir)

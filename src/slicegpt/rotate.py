@@ -120,6 +120,67 @@ def _build_topk_projector(Q: torch.Tensor, rank: int) -> tuple[torch.Tensor, int
     return Q_k @ Q_k.T, clamped_rank
 
 
+def _project_last_dim(x: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
+    """Project activations along the last dimension with projector P."""
+    P = P.to(device=x.device, dtype=torch.float64)
+    projected = torch.matmul(x.to(dtype=torch.float64), P)
+    return projected.to(dtype=x.dtype)
+
+
+def _make_input_projection_hook(P: torch.Tensor):
+    """Create a pre-forward hook that projects the first positional input."""
+
+    def _hook(_module: nn.Module, args: tuple) -> tuple:
+        if not args:
+            return args
+        return (_project_last_dim(args[0], P), *args[1:])
+
+    return _hook
+
+
+def _clear_layer_projection_hooks(layer: nn.Module) -> None:
+    """Remove projection hooks previously attached to this layer."""
+    handles = getattr(layer, "_projection_hook_handles", None)
+    if handles is not None:
+        for handle in handles:
+            handle.remove()
+    layer._projection_hook_handles = []
+
+
+def _register_layer_projection_hooks(
+    layer_adapter: LayerAdapter,
+    attention_projector: torch.Tensor | None = None,
+    mlp_projector: torch.Tensor | None = None,
+) -> None:
+    """
+    Register activation projection hooks on a layer.
+
+    Attention hooks:
+      - pre q/k/v linear: x <- x @ P
+    MLP hooks:
+      - pre MLP input linear(s): x <- x @ P
+    """
+    layer = layer_adapter.layer
+    _clear_layer_projection_hooks(layer)
+
+    handles = []
+    if attention_projector is not None:
+        for module in layer_adapter.get_attention_inputs():
+            handles.append(module.register_forward_pre_hook(_make_input_projection_hook(attention_projector)))
+
+    if mlp_projector is not None:
+        for module in layer_adapter.get_mlp_inputs():
+            handles.append(module.register_forward_pre_hook(_make_input_projection_hook(mlp_projector)))
+
+    layer._projection_hook_handles = handles
+
+
+def _clear_all_projection_hooks(model_adapter: ModelAdapter) -> None:
+    """Remove projection hooks from all layers."""
+    for layer_adapter in model_adapter.get_layers():
+        _clear_layer_projection_hooks(layer_adapter.layer)
+
+
 def rotate_attention_inputs(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
     # Rotate the WQ, WK and WV matrices of the self-attention layer.
     for W in layer_adapter.get_attention_inputs():
@@ -257,6 +318,9 @@ def rotate_and_slice(
         rotation_matrices: List of dicts containing eigenvalues and eigenvectors per layer (always computed)
         hidden_states: Dict mapping layer names to lists of hidden state tensors (if save_hidden_states=True), else None
     """
+    # Ensure no stale runtime projection hooks remain from previous runs.
+    _clear_all_projection_hooks(model_adapter)
+
     if ablation_config is None:
         ablation_config = AblationConfig()  # Default: both positions enabled
 
@@ -299,7 +363,9 @@ def rotate_and_project_sequential(
     Projection-only ablation for sequential blocks.
 
     This keeps residual width equal to hidden size. No slicing is applied.
-    Instead, top-k PCA projectors are applied inside attention and/or MLP.
+    Instead, top-k PCA projectors are applied to activations at sub-module inputs only:
+      - before q/k/v
+      - before MLP inputs
     """
     if projection_config is None:
         projection_config = ProjectionConfig(projection_only=True)
@@ -326,7 +392,7 @@ def rotate_and_project_sequential(
         logging.info("Saved embedding output hidden states")
 
     logging.info(f"Projection config: {projection_config.get_config_name()}")
-    logging.info("Projection-only mode enabled (no slicing, no embedding/head rotation)")
+    logging.info("Projection-only mode enabled (input-only activation projectors, no slicing, no embedding/head rotation)")
     logging.info(f"  Attention projection enabled: {projection_config.project_attention}")
     logging.info(f"  MLP projection enabled: {projection_config.project_mlp}")
 
@@ -336,6 +402,7 @@ def rotate_and_project_sequential(
             layer.attn_shortcut_Q = None
         if hasattr(layer, "mlp_shortcut_Q"):
             layer.mlp_shortcut_Q = None
+        _register_layer_projection_hooks(layer_adapter, None, None)
 
         attention_projection_enabled = projection_config.is_attention_projection_enabled(idx)
         mlp_projection_enabled = projection_config.is_mlp_projection_enabled(idx)
@@ -356,9 +423,11 @@ def rotate_and_project_sequential(
             "projector": P_attn.cpu(),
         })
 
-        if attention_projection_enabled:
-            rotate_attention_inputs(layer_adapter, P_attn)
-            rotate_attention_output(layer_adapter, P_attn)
+        _register_layer_projection_hooks(
+            layer_adapter,
+            attention_projector=P_attn if attention_projection_enabled else None,
+            mlp_projector=None,
+        )
 
         for i, inp in enumerate(inps):
             args[i] = layer_adapter.get_updated_args(inp, args[i])
@@ -383,9 +452,11 @@ def rotate_and_project_sequential(
             "projector": P_mlp.cpu(),
         })
 
-        if mlp_projection_enabled:
-            rotate_mlp_input(layer_adapter, P_mlp)
-            rotate_mlp_output(layer_adapter, P_mlp)
+        _register_layer_projection_hooks(
+            layer_adapter,
+            attention_projector=P_attn if attention_projection_enabled else None,
+            mlp_projector=P_mlp if mlp_projection_enabled else None,
+        )
 
         for i, inp in enumerate(inps):
             args[i] = layer_adapter.get_updated_args(inp, args[i])
@@ -416,6 +487,7 @@ def rotate_and_project_parallel(
     Projection-only ablation for parallel blocks.
 
     This keeps residual width equal to hidden size and applies no slicing.
+    Projectors are applied to activations around attention/MLP sub-modules.
     """
     if projection_config is None:
         projection_config = ProjectionConfig(projection_only=True)
@@ -442,7 +514,7 @@ def rotate_and_project_parallel(
         logging.info("Saved embedding output hidden states")
 
     logging.info(f"Projection config: {projection_config.get_config_name()}")
-    logging.info("Projection-only mode enabled (parallel blocks, no slicing)")
+    logging.info("Projection-only mode enabled (parallel blocks, input-only activation projectors, no slicing)")
     logging.info(f"  Attention projection enabled: {projection_config.project_attention}")
     logging.info(f"  MLP projection enabled: {projection_config.project_mlp}")
 
@@ -452,6 +524,7 @@ def rotate_and_project_parallel(
             layer.attn_shortcut_Q = None
         if hasattr(layer, "mlp_shortcut_Q"):
             layer.mlp_shortcut_Q = None
+        _register_layer_projection_hooks(layer_adapter, None, None)
 
         attention_projection_enabled = projection_config.is_attention_projection_enabled(idx)
         mlp_projection_enabled = projection_config.is_mlp_projection_enabled(idx)
@@ -485,13 +558,11 @@ def rotate_and_project_parallel(
             "projector": P_mlp.cpu(),
         })
 
-        if attention_projection_enabled:
-            rotate_attention_inputs(layer_adapter, P_attn)
-            rotate_attention_output(layer_adapter, P_attn)
-
-        if mlp_projection_enabled:
-            rotate_mlp_input(layer_adapter, P_mlp)
-            rotate_mlp_output(layer_adapter, P_mlp)
+        _register_layer_projection_hooks(
+            layer_adapter,
+            attention_projector=P_attn if attention_projection_enabled else None,
+            mlp_projector=P_mlp if mlp_projection_enabled else None,
+        )
 
         for i, inp in enumerate(inps):
             args[i] = layer_adapter.get_updated_args(inp, args[i])
