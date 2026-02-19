@@ -106,6 +106,11 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument(
         "--ppl-eval-nsamples", type=int, default=128, help="Number of samples to evaluate the perplexity on."
     )
+    parser.add_argument(
+        "--run-ppl",
+        action="store_true",
+        help="Enable perplexity evaluation (disabled by default).",
+    )
     parser.add_argument("--eval-baseline", action="store_true", help="Evaluate the baseline model.")
     parser.add_argument("--eval-fused-model", action="store_true", help="Evaluate the fused model.")
     parser.add_argument("--ppl-only", action="store_true", help="Evaluate the loaded model without doing compression.")
@@ -216,6 +221,8 @@ def slicing_main(args: argparse.Namespace) -> None:
     logging.info("Running SliceGPT experiment.")
     logging.info(f"PyTorch device: {config.device}")
     logging.info(f"Number of available cuda devices: {torch.cuda.device_count()}")
+    if not args.run_ppl:
+        logging.info("Perplexity evaluation disabled (enable with --run-ppl).")
 
     try:
         wandb.init(project=args.wandb_project, config=args, mode='disabled' if args.no_wandb else None)
@@ -260,20 +267,23 @@ def slicing_main(args: argparse.Namespace) -> None:
         varied_seqlen=args.varied_seqlen,
         seed=args.seed,
     )
-    test_loader = data_utils.prepare_test_dataloader(
-        dataset=test_dataset, tokenizer=tokenizer, batch_size=args.ppl_eval_batch_size
-    )
+    test_loader = None
+    if args.run_ppl:
+        test_loader = data_utils.prepare_test_dataloader(
+            dataset=test_dataset, tokenizer=tokenizer, batch_size=args.ppl_eval_batch_size
+        )
 
     # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
     if args.sliced_model_path or args.ppl_only:
-        reset_model_device()
-        dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
-        logging.info(f'Loaded model perplexity: {dataset_ppl}')
-        wandb.log({"original_ppl": dataset_ppl})
+        if args.run_ppl:
+            reset_model_device()
+            dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
+            logging.info(f'Loaded model perplexity: {dataset_ppl}')
+            wandb.log({"original_ppl": dataset_ppl})
         return
 
     # original ppl
-    if args.eval_baseline:
+    if args.run_ppl and args.eval_baseline:
         reset_model_device()
         dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
         logging.info(f'Original ppl: {dataset_ppl:.4f}')
@@ -288,7 +298,7 @@ def slicing_main(args: argparse.Namespace) -> None:
     layernorm_fusion.fuse_modules(model_adapter)
 
     # don't run this on large and/or distributed models
-    if args.eval_fused_model and not args.distribute_model:
+    if args.run_ppl and args.eval_fused_model and not args.distribute_model:
         model.to(config.device)
 
         dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
@@ -385,10 +395,11 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         logging.info(f"Saved sliced model to {args.save_dir}")
 
-    reset_model_device()
-    dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
-    logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
-    wandb.log({"sliced_ppl": dataset_ppl})
+    if args.run_ppl:
+        reset_model_device()
+        dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
+        logging.info(f'After rotating and slicing {dataset_ppl:.4f}')
+        wandb.log({"sliced_ppl": dataset_ppl})
 
     sliced_param_count = sum(int(p.nelement()) for p in model.parameters())
     sliced_fraction = 1.0 - sliced_param_count / original_param_count
